@@ -1,0 +1,1552 @@
+---
+title: "multilevel test"
+author: "Iliana Kleovoulou"
+date: "2023-06-16"
+output: html_document
+---
+
+```{r, echo=FALSE}
+library("INLA")
+source("functions.R")
+library("dplyr")
+library("stringr") 
+library("lattice")
+library("car")
+library("mvtnorm")
+```
+
+# Data cleaning and creation of all the indices required for the mixed effects models and ar models
+```{r}
+data = read.csv("Sensor_data3.csv", sep = ",")
+data$Participant.Id = as.factor(data$Participant.Id)
+data$Alert = as.factor(data$Alert)
+# check how many repeated measurements each patient has
+data.length = data %>%
+  count(Participant.Id)
+
+
+data$ID = c() # the new id index to separate each patient
+data$ID = c(rep(1,116), rep(2,181), rep(3,165), rep(4,200), rep(5, 181), 
+            rep(6,181), rep(7,181), rep(8,22), rep(9,181), rep(10, 181),
+            rep(11,181), rep(12,181), rep(13,181), rep(14,121), rep(15,181),
+            rep(16,181), rep(17,36), rep(18,180), rep(19,20), rep(20,181),
+            rep(21,181), rep(22,181), rep(23,181), rep(24,156), rep(25,181),
+            rep(26,56), rep(27,151), rep(28,181), rep(29,181), rep(30,91)
+            )
+data$numid = as.numeric(data$ID)
+
+nid = 30
+# the patients are labelled from 1-30 which we will use for the intercept component
+# we create another vector of length 30 (from 31 to 60) which corresponds to the same
+# patients but we use it for the random slope component. 
+data$slopeid = data$numid + nid
+
+#First, we create a new variable for the observation number within each patient, 
+#this is necessary as the data are unbalanced. So this variable will be:
+#1,2,3...,n1,1,2,3,...,n2,1,2,3,...,n3,.......
+#where n1, n2 and n3 are the number of repeated measurements for each patient.
+
+data$obs_number = ave(data$numid, data$numid, FUN = seq_along)
+
+baseline = read.csv("baseline.csv", sep=";")
+```
+
+
+```{r}
+data = merge(data, baseline, by= "Participant.Id")
+data$Gender = as.factor(data$Gender)
+data = data[, c("Participant.Id", "time_new", "S3overS1","Alert", "ID", "Gender", 
+                    "numid", "slopeid", "obs_number", "NightHeartRate")] # I added some extra sensors to expand the model 
+```
+
+# Split data into train and test. Add na rows in train set for predictions
+```{r}
+data$ID = as.factor(data$ID)
+n.hold <- 5
+df.id <- data %>%
+  group_split(ID)
+
+test.df <- df.id %>%
+  lapply(function(x) tail(x, n.hold)) %>%
+  bind_rows()
+
+df.id.append <- df.id
+
+for (i in 1:length(df.id)) {
+  n <- nrow(df.id[[i]])  # Get the number of rows for the current id group
+  n.train <- n - n.hold   # Calculate the training sample size for each group
+  
+  df.id.append[[i]]$S3overS1[(n.train + 1):n] <- NA
+  df.id.append[[i]]$NightHeartRate[(n.train + 1):n] <- NA
+}
+
+df.id.append <- bind_rows(df.id.append)
+```
+
+```{r}
+# create the 2 variables
+df.id.append$obs_alert = df.id.append$obs_number
+df.id.append$obs_nonalert = df.id.append$obs_number
+
+# if a patient does not have an alert, we assign NA values to those observations
+df.id.append$obs_alert = ifelse(df.id.append$Alert == 1, df.id.append$obs_alert, NA)
+# if a patient has an alert, we assign NA to those observations
+df.id.append$obs_nonalert = ifelse(df.id.append$Alert == 0, df.id.append$obs_nonalert, NA)
+```
+
+# Elaborate Multilevel Model
+# S3/S1
+The prior of log-precision of Gaussian residuals is again Log-Gamma(1,0.00005) and for
+the random effect is Log-gamma(1,0.00005).
+For fixed effect the prior is Gaussian distribution with μ = 0 and τ = 0.001.
+```{r}
+# fit mixed effect model with random intercepts
+formula1 = S3overS1 ~ 1 + time_new + f(numid, model = "iid") 
+
+inla.random.int = inla(formula = formula1,
+                       data = df.id.append,
+                       family = "gaussian",
+                      control.predictor = list(compute = TRUE),
+                      control.compute = list(
+                        dic = TRUE,
+                        waic = TRUE,
+                        cpo = TRUE))
+summary(inla.random.int)
+```
+The slope is zero and it is not statistical significant.
+```{r}
+model.sel.1 = model.selection.criteria(inla.random.int)
+model.sel.1
+#CPO and PIT
+cpoi = inla.random.int$cpo$cpo[!is.na(inla.random.int$cpo$cpo)]
+cpo = -sum(log(cpoi))
+cpo
+piti = inla.random.int$cpo$pit[!is.na(inla.random.int$cpo$pit)]
+pit=ks.test(piti,"punif",0,1)$statistic
+pit
+```
+We can transform the precision to standard deviation:
+```{r}
+sigma.dist = inla.tmarginal(
+  fun = function(x)
+    exp(-x/2),
+  marginal = inla.random.int$internal.marginals.hyperpar$`Log precision for the Gaussian observations`
+)
+sigma.zm = inla.zmarginal(sigma.dist)
+```
+
+```{r}
+sigma.int.dist = inla.tmarginal(
+  fun = function(x)
+    exp(-x/2),
+  marginal = inla.random.int$internal.marginals.hyperpar$`Log precision for numid`
+)
+sigma.int.zm = inla.zmarginal(sigma.int.dist)
+```
+
+
+```{r, echo = FALSE}
+library(brinla)
+bri.hyperpar.summary(inla.random.int)
+```
+Lets look at individual patients:
+
+We can check the posterior distribution of random intercepts:
+```{r}
+summary(inla.random.int$summary.random$numid$mean)
+```
+
+Residual analysis:
+```{r}
+# fitted values
+fit.random.int= inla.random.int$summary.fitted.values$mean
+
+# calculate the residuals directly from inla's outcome
+residuals = inla.random.int$residuals$deviance.residuals
+# or
+resid.random.inter = data$S3overS1 - fit.random.int
+
+plot(fit.random.int, resid.random.inter, xlab="predicted", ylab = "residuals", col=extended_data$Alert)
+```
+```{r}
+# or plot them separately
+xyplot(resid.random.inter ~ fit.random.int | Alert, data = extended_data,
+       xlab = "fitted values",
+       ylab = "Residuals",
+       grid = T, abline = c(h=0))
+
+xyplot(resid.random.inter ~ time_new | Alert, data = extended_data,
+       xlab = "time",
+       ylab = "Residuals",
+       grid = T, abline = c(h=0))
+```
+
+
+Normality check:
+```{r}
+qqnorm(resid.random.inter, pch = 1)
+qqline(resid.random.inter, col = "steelblue", lwd = 2)
+```
+Both tails deviate severely from the straight line.
+
+
+Out of sample evaluation:
+```{r}
+fit.model.random.inter = inla.random.int$summary.fitted.values
+
+obs.fit.random.inter = cbind.data.frame(S3overS1 = data$S3overS1, 
+                                        fit = fit.model.random.inter[, c(1)], 
+                                        Participant.Id = data$Participant.Id)
+
+data.mae  = obs.fit.random.inter %>%
+  group_split(Participant.Id) %>% 
+  lapply(function(x) tail(x, n.hold))
+
+#Average out of sample MAE
+mae.random.inter <- data.mae %>% 
+  sapply(function(x) mae(x$S3overS1, x$fit))
+
+pt.mae.random.inter <- str_remove_all(mae.random.inter,"MAE is ") %>% 
+  as.numeric 
+pt.mae.random.inter = pt.mae.random.inter[!is.na(pt.mae.random.inter)]
+
+mean.mae.random.inter  = mean(pt.mae.random.inter)
+mean.mae.random.inter
+```
+```{r}
+#Average out of sample MAPE
+mape.random.inter <- data.mae %>% 
+  sapply(function(x) mape(x$S3overS1, x$fit))
+
+pt.mape.random.inter <- str_remove_all(mape.random.inter,"MAPE is ") %>% 
+  as.numeric 
+pt.mape.random.inter = pt.mape.random.inter[!is.na(pt.mape.random.inter)]
+
+mean.mape.random.inter  = mean(pt.mape.random.inter)
+mean.mape.random.inter
+```
+
+To fit a mixed effect model with random intercepts and slopes we first need to 
+create some indices. We need to create the 'slopeid' which will be used to introduce
+the random slopes effect for each patient.
+The prior for the random effects is now Inv. Wishart.
+```{r}
+formula2 = S3overS1 ~  time_new +
+  f(numid, model = "iid2d", n = 2*nid) +
+  f(slopeid, time_new, copy = "numid") 
+
+# the copy arguments, create the correlation between the random components
+
+inla.random.slopes = inla(formula = formula2,
+     data = df.id.append,
+     family = "gaussian",
+     control.compute = list(
+       dic = TRUE,
+       waic = TRUE,
+       cpo = TRUE
+       ))
+summary(inla.random.slopes)
+```
+Again, the slope is not statistically significant (the credible interval contains zero). 
+
+```{r, echo=FALSE}
+bri.hyperpar.summary(inla.random.slopes)
+```
+
+The Rho:2 for numid, is the correlation between the two random effects. The correlation is -0.051.
+We can transform the log-precisions to sd:
+
+```{r}
+sigma.dist = inla.tmarginal(
+  fun = function(x)
+    exp(-x/2),
+  marginal = inla.random.slopes$internal.marginals.hyperpar$`Log precision for the Gaussian observations`
+)
+sigma.zm = inla.zmarginal(sigma.dist)
+```
+
+
+```{r}
+sigma.dist.int = inla.tmarginal(
+  fun = function(x)
+    exp(-x/2),
+  marginal = inla.random.slopes$internal.marginals.hyperpar$`Log precision for numid (component 1)`
+)
+sigma.int.zm = inla.zmarginal(sigma.dist.int)
+```
+
+
+```{r}
+sigma.dist.sl = inla.tmarginal(
+  fun = function(x)
+    exp(-x/2),
+  marginal = inla.random.slopes$internal.marginals.hyperpar$`Log precision for numid (component 2)`
+)
+sigma.sl.zm = inla.zmarginal(sigma.dist.sl)
+```
+
+
+```{r}
+model.sel2 = model.selection.criteria(inla.random.slopes)
+model.sel2
+
+#CPO and PIT
+cpoi = inla.random.slopes$cpo$cpo[!is.na(inla.random.slopes$cpo$cpo)]
+cpo = -sum(log(cpoi))
+cpo
+piti = inla.random.slopes$cpo$pit[!is.na(inla.random.slopes$cpo$pit)]
+pit=ks.test(piti,"punif",0,1)$statistic
+pit
+```
+
+
+Out of sample evaluation:
+```{r, echo=FALSE}
+fit.model.random.slopes = inla.random.slopes$summary.fitted.values
+
+obs.fit.random.slopes = cbind.data.frame(S3overS1 = data$S3overS1, 
+                                        fit = fit.model.random.slopes[, c(1)], 
+                                        Participant.Id = data$Participant.Id)
+
+data.mae  = obs.fit.random.slopes %>%
+  group_split(Participant.Id) %>% 
+  lapply(function(x) tail(x, n.hold))
+
+#Average out of sample MAE
+mae.random.slopes <- data.mae %>% 
+  sapply(function(x) mae(x$S3overS1, x$fit))
+
+pt.mae.random.slopes <- str_remove_all(mae.random.slopes,"MAE is ") %>% 
+  as.numeric 
+pt.mae.random.slopes = pt.mae.random.slopes[!is.na(pt.mae.random.slopes)]
+
+mean.mae.random.slopes  = mean(pt.mae.random.slopes)
+print(paste0("Models MAE: ", round(mean.mae.random.slopes,4)))
+
+```
+
+```{r, echo=FALSE}
+#Average out of sample MAPE
+mape.random.slopes <- data.mae %>% 
+  sapply(function(x) mape(x$S3overS1, x$fit))
+
+pt.mape.random.slopes <- str_remove_all(mape.random.slopes,"MAPE is ") %>% 
+  as.numeric 
+pt.mape.random.slopes = pt.mape.random.slopes[!is.na(pt.mape.random.slopes)]
+
+mean.mape.random.slopes  = mean(pt.mape.random.slopes)
+print(paste0("Models MAPE: ", round(mean.mape.random.slopes,4)))
+```
+Residual analysis:
+```{r}
+# fitted values
+fit.random.slp= inla.random.slopes$summary.fitted.values$mean
+
+# calculate the residuals
+residuals.slp = inla.random.slopes$residuals$deviance.residuals
+
+# residuals vs fitted values
+xyplot(residuals.slp ~ fit.random.slp | Alert, data = extended_data,
+       xlab = "fitted values",
+       ylab = "Residuals",
+       grid = T, abline = c(h=0))
+```
+A large spread around 0 on the plot of Alert=1.
+
+```{r}
+# residuals vs time
+xyplot(residuals.slp ~ time_new | Alert, data = extended_data,
+       xlab = "time",
+       ylab = "Residuals",
+       grid = T, abline = c(h=0))
+```
+Normality check:
+```{r}
+qqnorm(residuals.slp, pch = 1)
+qqline(residuals.slp, col = "steelblue", lwd = 2)
+```
+Slightly better than before.
+
+We can extract the individual profiles by adding the random intercepts to the 
+overall intercepts and the random slopes to the overall slopes. 
+```{r}
+postmean = matrix(inla.random.slopes$summary.random$numid[,2],nid,2) # take the mean and split in into 2 columns
+# because the random effects 1-30 refer to the intercepts and from 31-60 to the slopes
+
+# we add the fixed effects (overall intercept and slope with the random 
+# effects of each patient). 
+postmean = sweep(postmean,2,inla.random.slopes$summary.fixed$mean,"+")
+```
+
+```{r}
+# for better visualization, we choose to plot the fitted profiles for 5 patients only
+# alert free are 5.1, 19.1
+sample.ids = c("4.1", "5.1","19.1","30.1", "51.1")
+
+data.means = data[data$Participant.Id %in% sample.ids, ]
+
+p = ggplot(data.means, aes(time_new, S3overS1, group=Participant.Id)) + 
+       geom_line(aes(col=Participant.Id, linetype = Alert )) + xlab("time")
+p+geom_abline(intercept=postmean[c(1:2,5,8,14),1],slope=postmean[c(1:2,5,8,14),2],col='red',alpha=0.3)
+```
+From the fitted profiles, we can see that the fitted lines with an upward trend 
+corresponds to patients that had alert (dashed lines). 
+
+We add an gender, alert and an interaction between the alert and time:
+```{r}
+formula5 = S3overS1 ~  time_new + 
+  f(numid, model = "iid2d", n = 2*nid) +
+  f(slopeid, time_new, copy = "numid") +
+  Gender + Alert + time_new*Alert
+
+inla.inter = inla(formula = formula5,
+                  data = df.id.append,
+                  family = "gaussian",
+                  control.compute = list(
+                     dic = TRUE,
+                     waic = TRUE,
+                     cpo = TRUE))
+summary(inla.inter)
+```
+
+```{r}
+model.sel5 = model.selection.criteria(inla.inter)
+model.sel5
+
+cpoi = inla.inter$cpo$cpo[!is.na(inla.inter$cpo$cpo)]
+cpo = -sum(log(cpoi))
+piti = inla.inter$cpo$pit[!is.na(inla.inter$cpo$pit)]
+pit=ks.test(piti,"punif",0,1)$statistic
+
+print(paste0("CPO: ", round(cpo,4)))
+print(paste0("PIT: ", round(pit,5)))
+```
+
+```{r}
+sigma.dist = inla.tmarginal(
+  fun = function(x)
+    exp(-x/2),
+  marginal = inla.inter$internal.marginals.hyperpar$`Log precision for the Gaussian observations`
+)
+sigma.zm = inla.zmarginal(sigma.dist)
+```
+Residuals:
+```{r, echo=FALSE}
+# fitted values
+fit.inter= inla.inter$summary.fitted.values$mean
+
+# calculate the residuals
+residuals.inter = inla.inter$residuals$deviance.residuals
+
+# residuals vs fitted values
+xyplot(residuals.inter ~ fit.inter| Alert, data = extended_data,
+       xlab = "fitted values",
+       ylab = "Residuals",
+       grid = T, abline = c(h=0))
+```
+```{r, echo=FALSE}
+# residuals vs fitted values
+xyplot(residuals.inter ~ time_new| Alert, data = extended_data,
+       xlab = "time",
+       ylab = "Residuals",
+       grid = T, abline = c(h=0))
+```
+Normality:
+```{r}
+qqnorm(residuals.inter, pch = 1)
+qqline(residuals.inter, col = "steelblue", lwd = 2)
+```
+
+
+Out of sample evaluations
+```{r, echo=FALSE}
+fit.model.gender.alert.int = inla.inter$summary.fitted.values
+
+obs.fit.gender.alert.int = cbind.data.frame(S3overS1 = data$S3overS1, 
+                                        fit = fit.model.gender.alert.int[, c(1)], 
+                                        Participant.Id = data$Participant.Id)
+data.mae  = obs.fit.gender.alert.int %>%
+  group_split(Participant.Id) %>% 
+  lapply(function(x) tail(x, n.hold))
+
+#Average out of sample MAE
+mae.gender.alert.int <- data.mae %>% 
+  sapply(function(x) mae(x$S3overS1, x$fit))
+
+pt.mae.gender.alert.int <- str_remove_all(mae.gender.alert.int,"MAE is ") %>% 
+  as.numeric 
+pt.mae.gender.alert.int= pt.mae.gender.alert.int[!is.na(pt.mae.gender.alert.int)]
+
+mean.mae.gender.alert.int  = mean(pt.mae.gender.alert.int)
+print(paste0("MAE: ", round(mean.mae.gender.alert.int,4)))
+```
+```{r,echo=FALSE}
+#Average out of sample MAPE
+mape.gender.alert.int <- data.mae %>% 
+  sapply(function(x) mape(x$S3overS1, x$fit))
+
+pt.mape.gender.alert.int <- str_remove_all(mape.gender.alert.int,"MAPE is ") %>% 
+  as.numeric 
+pt.mape.gender.alert.int = pt.mape.gender.alert.int[!is.na(pt.mape.gender.alert.int)]
+
+mean.mape.gender.alert.int = mean(pt.mape.gender.alert.int)
+print(paste0("MAPE: ", round(mean.mape.gender.alert.int,4)))
+```
+
+
+Then we add the AR(1) in the model.
+```{r}
+formula6 = S3overS1 ~  time_new + 
+  f(numid, model = "iid2d", n = 2*nid) +
+  f(slopeid, time_new, copy = "numid") +
+  f(obs_number, model = "ar1", replicate = numid) + 
+  Gender + Alert + time_new*Alert 
+
+
+inla.mult.ar1 = inla(formula = formula6,
+                  data = df.id.append,
+                  family = "gaussian",
+                  control.compute = list(
+                     dic = TRUE,
+                     waic = TRUE,
+                     cpo = TRUE,
+                  config = TRUE),
+                  control.predictor = list(compute = TRUE),
+                  control.family =  list(initial = 10, fixed=TRUE))
+summary(inla.mult.ar1)
+```
+
+
+```{r, echo=FALSE}
+bri.hyperpar.summary(inla.mult.ar1)
+```
+
+```{r}
+model.sel6 = model.selection.criteria(inla.mult.ar1)
+model.sel6
+
+#CPO and PIT
+cpoi = inla.mult.ar1$cpo$cpo[!is.na(inla.mult.ar1$cpo$cpo)]
+cpo = -sum(log(cpoi))
+piti = inla.mult.ar1$cpo$pit[!is.na(inla.mult.ar1$cpo$pit)]
+pit=ks.test(piti,"punif",0,1)$statistic
+
+print(paste0("CPO: ", round(cpo,4)))
+print(paste0("PIT: ", round(pit,5)))
+```
+
+Model diagnostics: Now we added the AR(1) structure, to asses the fit of the model
+we use diagnostics that are used in time series analysis. We check if the residuals
+are autocorrelated. 
+
+Check if the residuals are correlated:
+```{r}
+# fitted values
+fit.mult.ar1= inla.mult.ar1$summary.fitted.values$mean
+
+# calculate the residuals
+residuals.mult.ar1 = inla.mult.ar1$residuals$deviance.residuals
+
+acf(residuals.mult.ar1, plot = T, na.action = na.pass)
+```
+There is a significant autocorrelation at lag 1.
+
+Out of sample evaluations
+```{r, echo=FALSE}
+fit.model.mult.ar1= inla.mult.ar1$summary.fitted.values
+
+obs.fit.mult.ar1 = cbind.data.frame(S3overS1 = data$S3overS1, 
+                                        fit = fit.model.mult.ar1[, c(1)], 
+                                        Participant.Id = data$Participant.Id)
+data.mae  = obs.fit.mult.ar1 %>%
+  group_split(Participant.Id) %>% 
+  lapply(function(x) tail(x, n.hold))
+
+#Average out of sample MAE
+mae.mult.ar1 <- data.mae %>% 
+  sapply(function(x) mae(x$S3overS1, x$fit))
+
+pt.mae.mult.ar1 <- str_remove_all(mae.mult.ar1,"MAE is ") %>% 
+  as.numeric 
+pt.mae.mult.ar1= pt.mae.mult.ar1[!is.na(pt.mae.mult.ar1)]
+
+mean.mae.mult.ar1 = mean(pt.mae.mult.ar1)
+print(paste0("MAE: ", round(mean.mae.mult.ar1,4)))
+```
+
+```{r, echo=FALSE}
+#Average out of sample MAPE
+mape.mult.ar1 <- data.mae %>% 
+  sapply(function(x) mape(x$S3overS1, x$fit))
+
+pt.mape.mult.ar1 <- str_remove_all(mape.mult.ar1,"MAPE is ") %>% 
+  as.numeric 
+pt.mape.mult.ar1 = pt.mape.mult.ar1[!is.na(pt.mape.mult.ar1)]
+
+mean.mape.mult.ar1= mean(pt.mape.mult.ar1)
+print(paste0("MAPE: ", round(mean.mape.mult.ar1,4)))
+```
+
+```{r}
+# random intercept and slopes, 2 AR(1) coefficients
+formula9 = S3overS1 ~  time_new + 
+   f(numid, model = "iid2d", n = 2*nid) +
+  f(slopeid, time_new, copy = "numid") +
+  f(obs_alert, model = "ar1", replicate = numid) +
+  f(obs_nonalert, model = "ar1", replicate = numid) + 
+  Gender + Alert + time_new*Alert 
+
+
+inla.two.ar = inla(formula = formula9,
+                  data = df.id.append,
+                  family = "gaussian",
+                  control.compute = list(
+                     dic = TRUE,
+                     waic = TRUE,
+                     cpo = TRUE,
+                  config = TRUE),
+                  control.predictor = list(compute = TRUE),
+                  control.family =  list(initial = 10, fixed=TRUE))
+summary(inla.two.ar)
+```
+
+```{r, echo=FALSE}
+bri.hyperpar.summary(inla.two.ar)
+```
+
+```{r}
+model.sel9 = model.selection.criteria(inla.two.ar)
+model.sel9
+
+#CPO and PIT
+cpoi = inla.two.ar$cpo$cpo[!is.na(inla.two.ar$cpo$cpo)]
+cpo = -sum(log(cpoi))
+piti = inla.two.ar$cpo$pit[!is.na(inla.two.ar$cpo$pit)]
+pit=ks.test(piti,"punif",0,1)$statistic
+
+print(paste0("CPO: ", round(cpo,4)))
+print(paste0("PIT: ", round(pit,5)))
+```
+Residuals:
+```{r}
+# fitted values
+fit.mult.two.ar= inla.two.ar$summary.fitted.values$mean
+
+# calculate the residuals
+residuals.mult.two.ar = inla.two.ar$residuals$deviance.residuals
+
+acf(residuals.mult.two.ar, plot = T, na.action = na.pass)
+```
+There is significant correlation at lag 1 (between values that are 1 day apart).
+
+Out of sample evaluations
+```{r, echo=FALSE}
+fit.model.two.ar= inla.two.ar$summary.fitted.values
+
+obs.fit.two.ar = cbind.data.frame(S3overS1 = data$S3overS1, 
+                                        fit = fit.model.two.ar[ , c(1)], 
+                                        Participant.Id = data$Participant.Id)
+data.mae  = obs.fit.two.ar%>%
+  group_split(Participant.Id) %>% 
+  lapply(function(x) tail(x, n.hold))
+
+#Average out of sample MAE
+mae.two.ar <- data.mae %>% 
+  sapply(function(x) mae(x$S3overS1, x$fit))
+
+pt.mae.two.ar <- str_remove_all(mae.two.ar,"MAE is ") %>% 
+  as.numeric 
+pt.mae.two.ar= pt.mae.two.ar[!is.na(pt.mae.two.ar)]
+
+mean.mae.two.ar = mean(pt.mae.two.ar)
+print(paste0("MAE: ", round(mean.mae.two.ar,4)))
+```
+
+```{r, echo=FALSE}
+#Average out of sample MAPE
+mape.two.ar <- data.mae %>% 
+  sapply(function(x) mape(x$S3overS1, x$fit))
+
+pt.mape.two.ar <- str_remove_all(mape.two.ar,"MAPE is ") %>% 
+  as.numeric 
+pt.mape.two.ar = pt.mape.two.ar[!is.na(pt.mape.two.ar)]
+
+mean.mape.two.ar= mean(pt.mape.two.ar)
+print(paste0("MAPE: ", round(mean.mape.two.ar,4)))
+```
+
+
+```{r}
+# random intercept,slopes and 2 AR(2) coefficients
+formula10 = S3overS1 ~  time_new + 
+   f(numid, model = "iid2d", n = 2*nid) +
+  f(slopeid, time_new, copy = "numid") +
+  f(obs_alert, model = "ar", order=2, replicate = numid) +
+  f(obs_nonalert, model = "ar", order = 2, replicate = numid) + 
+  Gender + Alert + time_new*Alert 
+
+
+inla.AR2.pergroup = inla(formula = formula10,
+                  data = df.id.append,
+                  family = "gaussian",
+                  control.compute = list(
+                     dic = TRUE,
+                     waic = TRUE,
+                     cpo = TRUE,
+                  config = TRUE),
+                  control.predictor = list(compute = TRUE),
+                  control.family =  list(initial = 10, fixed=TRUE))
+summary(inla.AR2.pergroup)
+```
+Phis for alert
+```{r}
+pacf = inla.AR2.pergroup$summary.hyperpar$mean[5:6]
+phi = inla.ar.pacf2phi(pacf)
+phi
+```
+
+```{r}
+pacf = inla.AR2.pergroup$summary.hyperpar$'0.025quant'[5:6]
+phi = inla.ar.pacf2phi(pacf)
+phi
+```
+
+```{r}
+pacf = inla.AR2.pergroup$summary.hyperpar$'0.975quant'[5:6]
+phi = inla.ar.pacf2phi(pacf)
+phi
+```
+Phis for non alert
+```{r}
+pacf = inla.AR2.pergroup$summary.hyperpar$mean[8:9]
+phi = inla.ar.pacf2phi(pacf)
+print(phi)
+```
+
+```{r}
+pacf = inla.AR2.pergroup$summary.hyperpar$'0.025quant'[8:9]
+phi = inla.ar.pacf2phi(pacf)
+print(phi)
+```
+
+```{r}
+pacf = inla.AR2.pergroup$summary.hyperpar$'0.975quant'[8:9]
+phi = inla.ar.pacf2phi(pacf)
+print(phi)
+```
+Variance of random intercept
+```{r}
+sigma2.int.dist = inla.tmarginal(
+  fun = function(x)
+    exp(-x),
+  marginal = inla.AR2.pergroup$internal.marginals.hyperpar$`Log precision for numid (component 1)`
+)
+sigma2.int.zm = inla.zmarginal(sigma2.int.dist)
+```
+Variance of random slope
+```{r}
+sigma2.slope.dist = inla.tmarginal(
+  fun = function(x)
+    exp(-x),
+  marginal = inla.AR2.pergroup$internal.marginals.hyperpar$`Log precision for numid (component 2)`
+)
+sigma2.slope.zm = inla.zmarginal(sigma2.slope.dist)
+```
+State variance for non alert
+```{r}
+pacf = inla.AR2.pergroup$summary.hyperpar$mean[8:9]
+phi = inla.ar.pacf2phi(pacf)
+psiwt.ar2 <- ARMAtoMA(ar = phi, ma = 0, 100)
+precision.x.hat <- inla.AR2.pergroup$summary.hyperpar$mean[7]
+sigma2.w.hat <-
+  inla.emarginal(
+    fun = function(x)
+      exp(-x),
+    marginal = inla.AR2.pergroup$internal.marginals.hyperpar$`Log precision for obs_nonalert`
+  ) / sum(psiwt.ar2 ^ 2)
+cat(paste(
+  "Estimated state noise variance, sigma2.w",
+  round(sigma2.w.hat, 3),
+  sep = " = "
+),
+"\n")
+```
+
+```{r}
+sigma2.w.hat.t <-
+  inla.tmarginal(
+    fun = function(x)
+      exp(-x),
+    marginal = inla.AR2.pergroup$internal.marginals.hyperpar$`Log precision for obs_nonalert`
+  ) / sum(psiwt.ar2 ^ 2)
+
+a = inla.zmarginal(sigma2.w.hat.t)
+```
+State variance for alert
+```{r}
+pacf = inla.AR2.pergroup$summary.hyperpar$mean[5:6]
+phi = inla.ar.pacf2phi(pacf)
+psiwt.ar2 <- ARMAtoMA(ar = phi, ma = 0, 100)
+precision.x.hat <- inla.AR2.pergroup$summary.hyperpar$mean[4]
+sigma2.w.hat <-
+  inla.emarginal(
+    fun = function(x)
+      exp(-x),
+    marginal = inla.AR2.pergroup$internal.marginals.hyperpar$`Log precision for obs_alert`
+  ) / sum(psiwt.ar2 ^ 2)
+cat(paste(
+  "Estimated state noise variance, sigma2.w",
+  round(sigma2.w.hat, 3),
+  sep = " = "
+),
+"\n")
+```
+```{r}
+sigma2.w.hat.t <-
+  inla.tmarginal(
+    fun = function(x)
+      exp(-x),
+    marginal = inla.AR2.pergroup$internal.marginals.hyperpar$`Log precision for obs_alert`
+  ) / sum(psiwt.ar2 ^ 2)
+
+a = inla.zmarginal(sigma2.w.hat.t)
+
+```
+
+```{r, echo=FALSE}
+fit.AR2.pergroup = inla.AR2.pergroup$summary.fitted.values
+
+obs.AR2.pergroup = cbind.data.frame(S3overS1 = data$S3overS1, 
+                                        fit.AR2.pergroup[, c(1,2,3)], 
+                                        Participant.Id = data$Participant.Id)
+data.mae  = obs.AR2.pergroup %>%
+  group_split(Participant.Id) %>% 
+  lapply(function(x) tail(x, n.hold))
+
+mae.AR2.pergroup <- data.mae %>% 
+  sapply(function(x) mae(x$S3overS1, x$mean))
+
+pt.mae.AR2.pergroup <- str_remove_all(mae.AR2.pergroup,"MAE is ") %>% 
+  as.numeric 
+pt.mae.AR2.pergroup= pt.mae.AR2.pergroup[!is.na(pt.mae.AR2.pergroup)]
+
+mean.mae.AR2.pergroup = mean(pt.mae.AR2.pergroup)
+print(paste0("MAE: ", round(mean.mae.AR2.pergroup,4)))
+```
+
+```{r}
+mape.AR2.pergroup <- data.mae %>% 
+  sapply(function(x) mape(x$S3overS1, x$mean))
+
+pt.mape.AR2.pergroup <- str_remove_all(mape.AR2.pergroup,"MAPE is ") %>% 
+  as.numeric 
+pt.mape.AR2.pergroup = pt.mape.AR2.pergroup[!is.na(pt.mape.AR2.pergroup)]
+
+mean.mape.AR2.pergroup= mean(pt.mape.AR2.pergroup)
+print(paste0("MAPE: ", round(mean.mape.AR2.pergroup,4)))
+
+```
+
+GOF:
+```{r}
+#marginal likelihood
+inla.AR2.pergroup$mlik
+# DIC and WAIC
+model.selection.criteria(inla.AR2.pergroup)
+#CPO and PIT
+cpoi = inla.AR2.pergroup$cpo$cpo[!is.na(inla.AR2.pergroup$cpo$cpo)]
+cpo = -sum(log(cpoi))
+piti = inla.AR2.pergroup$cpo$pit[!is.na(inla.AR2.pergroup$cpo$pit)]
+pit=ks.test(piti,"punif",0,1)$statistic
+
+print(paste0("CPO: ", round(cpo,4)))
+print(paste0("PIT: ", round(pit,5)))
+
+```
+
+
+# Simpler form of elaborated
+```{r}
+formula8 = S3overS1 ~  time_new + 
+ f(numid, model = "iid2d", n = 2*nid) +
+  f(slopeid, time_new, copy = "numid") +
+  f(obs_number, model = "ar", order = 2, replicate = numid) +
+  Gender + Alert + time_new*Alert 
+
+
+inla.mult.ar2= inla(formula = formula8,
+                  data = df.id.append,
+                  family = "gaussian",
+                  control.compute = list(
+                     dic = TRUE,
+                     waic = TRUE,
+                     cpo = TRUE,
+                  config = TRUE),
+                  control.predictor = list(compute = TRUE),
+                  control.family =  list(initial = 10, fixed=TRUE))
+summary(inla.mult.ar2)
+```
+
+
+```{r}
+pacf = inla.mult.ar2$summary.hyperpar$mean[5:6]
+phi = inla.ar.pacf2phi(pacf)
+phi
+```
+```{r}
+pacf = inla.mult.ar2$summary.hyperpar$'0.025quant'[5:6]
+phi = inla.ar.pacf2phi(pacf)
+phi
+```
+
+```{r}
+pacf = inla.mult.ar2$summary.hyperpar$'0.975quant'[5:6]
+phi = inla.ar.pacf2phi(pacf)
+phi
+```
+
+
+```{r}
+pacf = inla.mult.ar2$summary.hyperpar$mean[5:6]
+phi = inla.ar.pacf2phi(pacf)
+psiwt.ar2 <- ARMAtoMA(ar = phi, ma = 0, 100)
+precision.x.hat <- inla.mult.ar2$summary.hyperpar$mean[4]
+sigma2.w.hat <-
+  inla.emarginal(
+    fun = function(x)
+      exp(-x),
+    marginal = inla.mult.ar2$internal.marginals.hyperpar$`Log precision for obs_number`
+  ) / sum(psiwt.ar2 ^ 2)
+cat(paste(
+  "Estimated state noise variance, sigma2.w",
+  round(sigma2.w.hat, 3),
+  sep = " = "
+),
+"\n")
+```
+
+```{r}
+sigma2.w.hat.t <-
+  inla.tmarginal(
+    fun = function(x)
+      exp(-x),
+    marginal = inla.mult.ar2$internal.marginals.hyperpar$`Log precision for obs_number`
+  ) / sum(psiwt.ar2 ^ 2)
+
+a = inla.zmarginal(sigma2.w.hat.t)
+
+```
+obtain the same from brinla:
+```{r}
+bri.hyperpar.summary(inla.mult.ar2)
+```
+
+Variance of random intercepts
+```{r}
+sigma2.int.dist = inla.tmarginal(
+  fun = function(x)
+    exp(-x),
+  marginal = inla.mult.ar2$internal.marginals.hyperpar$`Log precision for numid (component 1)`
+)
+sigma2.int.zm = inla.zmarginal(sigma2.int.dist)
+```
+Variance of random slopes
+```{r}
+sigma2.slope.dist = inla.tmarginal(
+  fun = function(x)
+    exp(-x),
+  marginal = inla.mult.ar2$internal.marginals.hyperpar$`Log precision for numid (component 2)`
+)
+sigma2.slope.zm = inla.zmarginal(sigma2.slope.dist)
+```
+
+GOF:
+```{r}
+#marginal likelihood
+inla.AR2.pergroup.nhr$mlik
+# DIC and WAIC
+model.selection.criteria(inla.AR2.pergroup.nhr)
+#CPO and PIT
+cpoi = inla.AR2.pergroup.nhr$cpo$cpo[!is.na(inla.AR2.pergroup.nhr$cpo$cpo)]
+cpo = -sum(log(cpoi))
+piti = inla.AR2.pergroup.nhr$cpo$pit[!is.na(inla.AR2.pergroup.nhr$cpo$pit)]
+pit=ks.test(piti,"punif",0,1)$statistic
+
+print(paste0("CPO: ", round(cpo,4)))
+print(paste0("PIT: ", round(pit,5)))
+```
+
+```{r, echo=FALSE}
+fit.inla.mult.ar2 = inla.mult.ar2$summary.fitted.values
+
+obs.inla.mult.ar2 = cbind.data.frame(S3overS1 = data$S3overS1, 
+                                        fit.inla.mult.ar2[, c(1,2,3)], 
+                                        Participant.Id = data$Participant.Id)
+data.mae  = obs.inla.mult.ar2 %>%
+  group_split(Participant.Id) %>% 
+  lapply(function(x) tail(x, n.hold))
+
+mae.inla.mult.ar2 <- data.mae %>% 
+  sapply(function(x) mae(x$S3overS1, x$mean))
+
+pt.mae.inla.mult.ar2 <- str_remove_all(mae.inla.mult.ar2,"MAE is ") %>% 
+  as.numeric 
+pt.mae.inla.mult.ar2 = pt.mae.inla.mult.ar2[!is.na(pt.mae.inla.mult.ar2)]
+
+mean.mae.inla.mult.ar2 = mean(pt.mae.inla.mult.ar2)
+print(paste0("MAE: ", round(mean.mae.inla.mult.ar2,4)))
+
+```
+
+```{r}
+mape.inla.mult.ar2 <- data.mae %>% 
+  sapply(function(x) mape(x$S3overS1, x$mean))
+
+pt.mape.inla.mult.ar2 <- str_remove_all(mape.inla.mult.ar2,"MAPE is ") %>% 
+  as.numeric 
+pt.mape.inla.mult.ar2 = pt.mape.inla.mult.ar2[!is.na(pt.mape.inla.mult.ar2)]
+
+mean.mape.inla.mult.ar2 = mean(pt.mape.inla.mult.ar2)
+print(paste0("MAPE: ", round(mean.mape.inla.mult.ar2,4)))
+
+```
+
+
+#Night heart rate
+Fit M1: Linear Mixed effect model with random intercpets, slopes, and fixed effects
+of gender, alert and an interaction between time and alert.
+```{r}
+formulaM1 = NightHeartRate ~  time_new + 
+  f(numid, model = "iid2d", n = 2*nid) +
+  f(slopeid, time_new, copy = "numid") +
+  Gender + Alert + time_new*Alert
+
+inla.M1 = inla(formula = formulaM1,
+                  data = df.id.append,
+                  family = "gaussian",
+                  control.compute = list(
+                     dic = TRUE,
+                     waic = TRUE,
+                     cpo = TRUE))
+summary(inla.M1)
+```
+
+
+```{r}
+model.selection.criteria(inla.M1)
+
+#CPO and PIT
+cpoi = inla.M1$cpo$cpo[!is.na(inla.M1$cpo$cpo)]
+cpo = -sum(log(cpoi))
+piti = inla.M1$cpo$pit[!is.na(inla.M1$cpo$pit)]
+pit=ks.test(piti,"punif",0,1)$statistic
+
+print(paste0("CPO: ", round(cpo,4)))
+print(paste0("PIT: ", round(pit,5)))
+```
+```{r}
+postmean = matrix(inla.random.slopes$summary.random$numid[,2],nid,2) # take the mean and split in into 2 columns
+# because the random effects 1-30 refer to the intercepts and from 31-60 to the slopes
+
+# we add the fixed effects (overall intercept and slope with the random 
+# effects of each patient). 
+postmean = sweep(postmean,2,inla.random.slopes$summary.fixed$mean,"+")
+```
+
+
+Out of sample evaluations
+```{r, echo=FALSE}
+fit.M1= inla.M1$summary.fitted.values
+
+obs.M1 = cbind.data.frame(NHR = data$NightHeartRate, 
+                                        fit = fit.M1[, c(1)], 
+                                        Participant.Id = data$Participant.Id)
+data.mae  = obs.M1%>%
+  group_split(Participant.Id) %>% 
+  lapply(function(x) tail(x, n.hold))
+
+#Average out of sample MAE
+mae.M1 <- data.mae %>% 
+  sapply(function(x) mae(x$NHR, x$fit))
+
+pt.mae.M1<- str_remove_all(mae.M1,"MAE is ") %>% 
+  as.numeric 
+pt.mae.M1= pt.mae.M1[!is.na(pt.mae.M1)]
+
+mean.mae.M1= mean(pt.mae.M1)
+print(paste0("MAE: ", round(mean.mae.M1,4)))
+```
+```{r, echo=FALSE}
+#Average out of sample MAPE
+mape.M1<- data.mae %>% 
+  sapply(function(x) mape(x$NHR, x$fit))
+
+pt.mape.M1 <- str_remove_all(mape.M1,"MAPE is ") %>% 
+  as.numeric 
+pt.mape.M1 = pt.mape.M1[!is.na(pt.mape.M1)]
+
+mean.mape.M1= mean(pt.mape.M1)
+print(paste0("MAPE: ", round(mean.mape.M1,4)))
+```
+
+M2: The same as above plus an AR(1) process.
+```{r}
+formulaM2 = NightHeartRate ~  time_new + 
+  f(numid, model = "iid2d", n = 2*nid) +
+  f(slopeid, time_new, copy = "numid") +
+  f(obs_number, model = "ar1", replicate = numid) +
+  Gender + Alert + time_new*Alert
+
+inla.M2 = inla(formula = formulaM2,
+                  data = df.id.append,
+                  family = "gaussian",
+                  control.compute = list(
+                     dic = TRUE,
+                     waic = TRUE,
+                     cpo = TRUE),
+               control.family = list(initial = 10, fixed=TRUE))
+summary(inla.M2)
+```
+
+
+```{r, echo=FALSE}
+model.selection.criteria(inla.M2)
+
+#CPO and PIT
+cpoi = inla.M2$cpo$cpo[!is.na(inla.M2$cpo$cpo)]
+cpo = -sum(log(cpoi))
+piti = inla.M2$cpo$pit[!is.na(inla.M2$cpo$pit)]
+pit=ks.test(piti,"punif",0,1)$statistic
+
+print(paste0("CPO: ", round(cpo,4)))
+print(paste0("PIT: ", round(pit,5)))
+```
+```{r, echo=FALSE}
+fit.M2= inla.M2$summary.fitted.values
+
+obs.M2 = cbind.data.frame(NHR = data$NightHeartRate, 
+                                        fit = fit.M2[, c(1)], 
+                                        Participant.Id = data$Participant.Id)
+data.mae  = obs.M2 %>%
+  group_split(Participant.Id) %>% 
+  lapply(function(x) tail(x, n.hold))
+
+#Average out of sample MAE
+mae.M2 <- data.mae %>% 
+  sapply(function(x) mae(x$NHR, x$fit))
+
+pt.mae.M2<- str_remove_all(mae.M2,"MAE is ") %>% 
+  as.numeric 
+pt.mae.M2= pt.mae.M2[!is.na(pt.mae.M2)]
+
+mean.mae.M2= mean(pt.mae.M2)
+print(paste0("MAE: ", round(mean.mae.M2,4)))
+```
+```{r, echo=FALSE}
+#Average out of sample MAPE
+mape.M2<- data.mae %>% 
+  sapply(function(x) mape(x$NHR, x$fit))
+
+pt.mape.M2 <- str_remove_all(mape.M2,"MAPE is ") %>% 
+  as.numeric 
+pt.mape.M2 = pt.mape.M2[!is.na(pt.mape.M2)]
+
+mean.mape.M2 = mean(pt.mape.M2)
+print(paste0("MAPE: ", round(mean.mape.M2,4)))
+```
+
+M3: M1 plus AR(1) structure per alert/non alert group
+```{r}
+# random intercept and slopes, 2 AR(1) coefficients
+formulaM3 = NightHeartRate ~  time_new + 
+  f(numid, model = "iid2d", n = 2*nid) +
+  f(slopeid, time_new, copy = "numid") +
+  f(obs_alert, model = "ar1", replicate = numid) +
+  f(obs_nonalert, model = "ar1", replicate = numid) + 
+  Gender + Alert + time_new*Alert 
+
+
+inla.M3 = inla(formula = formulaM3,
+                  data = df.id.append,
+                  family = "gaussian",
+                  control.compute = list(
+                     dic = TRUE,
+                     waic = TRUE,
+                     cpo = TRUE,
+                  config = TRUE),
+                  control.predictor = list(compute = TRUE),
+                  control.family =  list(initial = 10, fixed=TRUE))
+summary(inla.M3)
+```
+
+```{r, echo=FALSE}
+bri.hyperpar.summary(inla.M3)
+```
+```{r}
+bri.hyperpar.plot(inla.M3, together = F)
+```
+
+```{r}
+model.selection.criteria(inla.M3)
+
+#CPO and PIT
+cpoi = inla.M3$cpo$cpo[!is.na(inla.M3$cpo$cpo)]
+cpo = -sum(log(cpoi))
+piti = inla.M3$cpo$pit[!is.na(inla.M3$cpo$pit)]
+pit=ks.test(piti,"punif",0,1)$statistic
+
+print(paste0("CPO: ", round(cpo,4)))
+print(paste0("PIT: ", round(pit,5)))
+```
+
+
+```{r, echo=FALSE}
+fit.M3= inla.M3$summary.fitted.values
+
+obs.M3 = cbind.data.frame(NHR = data$NightHeartRate, 
+                                        fit = fit.M3[, c(1)], 
+                                        Participant.Id = data$Participant.Id)
+data.mae  = obs.M3 %>%
+  group_split(Participant.Id) %>% 
+  lapply(function(x) tail(x, n.hold))
+
+#Average out of sample MAE
+mae.M3 <- data.mae %>% 
+  sapply(function(x) mae(x$NHR, x$fit))
+
+pt.mae.M3 <- str_remove_all(mae.M3,"MAE is ") %>% 
+  as.numeric 
+pt.mae.M3= pt.mae.M3[!is.na(pt.mae.M3)]
+
+mean.mae.M3= mean(pt.mae.M3)
+print(paste0("MAE: ", round(mean.mae.M3,4)))
+```
+```{r, echo=FALSE}
+#Average out of sample MAPE
+mape.M3 <- data.mae %>% 
+  sapply(function(x) mape(x$NHR, x$fit))
+
+pt.mape.M3 <- str_remove_all(mape.M3,"MAPE is ") %>% 
+  as.numeric 
+pt.mape.M3 = pt.mape.M3[!is.na(pt.mape.M3)]
+
+mean.mape.M3 = mean(pt.mape.M3)
+print(paste0("MAPE: ", round(mean.mape.M3,4)))
+```
+
+Elaborate model
+```{r}
+# random intercept,slopes and 2 AR(2) coefficients
+formula.nhr = NightHeartRate ~  time_new + 
+   f(numid, model = "iid2d", n = 2*nid) +
+  f(slopeid, time_new, copy = "numid") +
+  f(obs_alert, model = "ar", order=2, replicate = numid) +
+  f(obs_nonalert, model = "ar", order = 2, replicate = numid) + 
+  Gender + Alert + time_new*Alert 
+
+set.seed(123)
+inla.AR2.pergroup.nhr = inla(formula = formula.nhr,
+                  data = df.id.append,
+                  family = "gaussian",
+                  control.compute = list(
+                     dic = TRUE,
+                     waic = TRUE,
+                     cpo = TRUE,
+                  config = TRUE),
+                  control.predictor = list(compute = TRUE),
+                  control.family =  list(initial = 10, fixed=TRUE))
+summary(inla.AR2.pergroup.nhr)
+```
+phi for alert
+
+```{r}
+pacf = inla.AR2.pergroup.nhr$summary.hyperpar$mean[5:6]
+phi = inla.ar.pacf2phi(pacf)
+phi
+```
+
+```{r}
+pacf = inla.AR2.pergroup.nhr$summary.hyperpar$'0.025quant'[5:6]
+phi = inla.ar.pacf2phi(pacf)
+phi
+```
+
+```{r}
+pacf = inla.AR2.pergroup.nhr$summary.hyperpar$'0.975quant'[5:6]
+phi = inla.ar.pacf2phi(pacf)
+phi
+```
+
+phi for non alert
+```{r}
+pacf = inla.AR2.pergroup.nhr$summary.hyperpar$mean[8:9]
+phi = inla.ar.pacf2phi(pacf)
+print(phi)
+```
+
+```{r}
+pacf = inla.AR2.pergroup.nhr$summary.hyperpar$'0.025quant'[8:9]
+phi = inla.ar.pacf2phi(pacf)
+print(phi)
+```
+
+```{r}
+pacf = inla.AR2.pergroup.nhr$summary.hyperpar$'0.975quant'[8:9]
+phi = inla.ar.pacf2phi(pacf)
+print(phi)
+```
+
+
+```{r}
+bri.hyperpar.summary(inla.AR2.pergroup.nhr)
+```
+
+GOF:
+```{r}
+#marginal likelihood
+inla.AR2.pergroup.nhr$mlik
+# DIC and WAIC
+model.selection.criteria(inla.AR2.pergroup.nhr)
+#CPO and PIT
+cpoi = inla.AR2.pergroup.nhr$cpo$cpo[!is.na(inla.AR2.pergroup.nhr$cpo$cpo)]
+cpo = -sum(log(cpoi))
+piti = inla.AR2.pergroup.nhr$cpo$pit[!is.na(inla.AR2.pergroup.nhr$cpo$pit)]
+pit=ks.test(piti,"punif",0,1)$statistic
+
+print(paste0("CPO: ", round(cpo,4)))
+print(paste0("PIT: ", round(pit,5)))
+```
+
+
+
+```{r, echo=FALSE}
+fit.AR2.pergroup.nhr = inla.AR2.pergroup.nhr$summary.fitted.values
+
+obs.AR2.pergroup.nhr = cbind.data.frame(NHR = data$NightHeartRate, 
+                                        fit.AR2.pergroup.nhr[, c(1,2,3)], 
+                                        Participant.Id = data$Participant.Id)
+data.mae  = obs.AR2.pergroup.nhr %>%
+  group_split(Participant.Id) %>% 
+  lapply(function(x) tail(x, n.hold))
+
+mae.AR2.pergroup.nhr <- data.mae %>% 
+  sapply(function(x) mae(x$NHR, x$mean))
+
+pt.mae.AR2.pergroup.nhr <- str_remove_all(mae.AR2.pergroup.nhr,"MAE is ") %>% 
+  as.numeric 
+pt.mae.AR2.pergroup.nhr= pt.mae.AR2.pergroup.nhr[!is.na(pt.mae.AR2.pergroup.nhr)]
+
+mean.mae.AR2.pergroup.nhr = mean(pt.mae.AR2.pergroup.nhr)
+print(paste0("MAE: ", round(mean.mae.AR2.pergroup.nhr,4)))
+
+```
+```{r}
+mape.AR2.pergroup.nhr <- data.mae %>% 
+  sapply(function(x) mape(x$NHR, x$mean))
+
+pt.mape.AR2.pergroup.nhr <- str_remove_all(mape.AR2.pergroup.nhr,"MAPE is ") %>% 
+  as.numeric 
+pt.mape.AR2.pergroup.nhr = pt.mape.AR2.pergroup.nhr[!is.na(pt.mape.AR2.pergroup.nhr)]
+
+mean.mape.AR2.pergroup.nhr = mean(pt.mape.AR2.pergroup.nhr)
+print(paste0("MAPE: ", round(mean.mape.AR2.pergroup.nhr,4)))
+
+```
+```{r}
+forecast = data.mae[[1]]$mean
+fore =c(rep(NA, 111),forecast)
+
+obs = data$NightHeartRate[data$Participant.Id == "4.1"]
+
+fore.low <- c(
+  rep(NA, 111),
+  forecast -
+    2 * (data.mae[[1]])$sd
+)
+fore.up <- c(
+  rep(NA, 111),
+  forecast +
+    2 * (data.mae[[1]])$sd
+)
+fore.up
+plot.df <-
+  cbind.data.frame(time = 1:116, obs, fore, fore.low, fore.up)
+plot.p4 = plot.df %>%
+  ggplot(aes(x = time)) +
+  geom_line(aes(y = obs), color = "#D55E00") +
+  geom_line(aes(y = fore), color = "#0072B2") +
+  geom_ribbon(aes(ymin = fore.low, ymax = fore.up), alpha =
+                .2) +
+  geom_vline(xintercept = 111 + 1,
+             ylab = "",
+             size = 0.2) +
+  xlab(label = "t") +
+  ylab(label = "Night heart rate") +
+  ggtitle("")
+plot.p4
+```
+
+```{r}
+forecast = data.mae[[2]]$mean
+fore =c(rep(NA, 176),forecast)
+
+obs = data$NightHeartRate[data$Participant.Id == "5.1"]
+
+fore.low <- c(
+  rep(NA, 176),
+  forecast -
+    2 * (data.mae[[2]])$sd
+)
+fore.up <- c(
+  rep(NA, 176),
+  forecast +
+    2 * (data.mae[[2]])$sd
+)
+fore.up
+plot.df <-
+  cbind.data.frame(time = 1:181, obs, fore, fore.low, fore.up)
+plot.p5 = plot.df %>%
+  ggplot(aes(x = time)) +
+  geom_line(aes(y = obs), color = "#D55E00") +
+  geom_line(aes(y = fore), color = "#0072B2") +
+  geom_ribbon(aes(ymin = fore.low, ymax = fore.up), alpha =
+                .2) +
+  geom_vline(xintercept = 176 + 1,
+             ylab = "",
+             size = 0.2) +
+  xlab(label = "t") +
+  ylab(label = expression(y[t])) +
+  ggtitle("p5")
+plot.p5
+
+```
+```{r}
+model.selection.criteria(inla.AR2.pergroup.nhr)
+
+```
+```{r, echo=FALSE}
+#CPO and PIT
+cpoi = inla.AR2.pergroup.nhr$cpo$cpo[!is.na(inla.AR2.pergroup.nhr$cpo$cpo)]
+cpo = -sum(log(cpoi))
+piti = inla.AR2.pergroup.nhr$cpo$pit[!is.na(inla.AR2.pergroup.nhr$cpo$pit)]
+pit=ks.test(piti,"punif",0,1)$statistic
+
+print(paste0("CPO: ", round(cpo,4)))
+print(paste0("PIT: ", round(pit,5)))
+```
+
+# Simpler form of elaborated model with night heart rate
+```{r}
+formula8.nhr = NightHeartRate ~  time_new + 
+ f(numid, model = "iid2d", n = 2*nid) +
+  f(slopeid, time_new, copy = "numid") +
+  f(obs_number, model = "ar", order = 2, replicate = numid) +
+  Gender + Alert + time_new*Alert 
+
+
+inla.mult.ar2.nhr = inla(formula = formula8.nhr,
+                  data = df.id.append,
+                  family = "gaussian",
+                  control.compute = list(
+                     dic = TRUE,
+                     waic = TRUE,
+                     cpo = TRUE,
+                  config = TRUE),
+                  control.predictor = list(compute = TRUE),
+                  control.family =  list(initial = 10, fixed=TRUE))
+summary(inla.mult.ar2.nhr)
+```
+
+```{r}
+pacf = inla.mult.ar2.nhr$summary.hyperpar$mean[5:6]
+phi = inla.ar.pacf2phi(pacf)
+phi
+```
+```{r}
+pacf = inla.mult.ar2.nhr$summary.hyperpar$'0.025quant'[5:6]
+phi = inla.ar.pacf2phi(pacf)
+phi
+```
+```{r}
+pacf = inla.mult.ar2.nhr$summary.hyperpar$'0.0975quant'[5:6]
+phi = inla.ar.pacf2phi(pacf)
+phi
+```
+
+```{r}
+bri.hyperpar.summary(inla.mult.ar2.nhr)
+```
+
+```{r}
+model.selection.criteria(inla.mult.ar2.nhr)
+
+```
+```{r, echo=FALSE}
+#CPO and PIT
+cpoi = inla.mult.ar2.nhr$cpo$cpo[!is.na(inla.mult.ar2.nhr$cpo$cpo)]
+cpo = -sum(log(cpoi))
+piti = inla.mult.ar2.nhr$cpo$pit[!is.na(inla.mult.ar2.nhr$cpo$pit)]
+pit=ks.test(piti,"punif",0,1)$statistic
+
+print(paste0("CPO: ", round(cpo,4)))
+print(paste0("PIT: ", round(pit,5)))
+```
+
+
+```{r, echo=FALSE}
+fit.simpler.nhr = inla.mult.ar2.nhr$summary.fitted.values
+
+obs.simpler.nhr = cbind.data.frame(NHR = data$NightHeartRate, 
+                                        fit.simpler.nhr[, c(1,2,3)], 
+                                        Participant.Id = data$Participant.Id)
+data.mae  = obs.simpler.nhr %>%
+  group_split(Participant.Id) %>% 
+  lapply(function(x) tail(x, n.hold))
+
+mae.AR2.simpler.nhr <- data.mae %>% 
+  sapply(function(x) mae(x$NHR, x$mean))
+
+pt.mae.AR2.simpler.nhr <- str_remove_all(mae.AR2.simpler.nhr,"MAE is ") %>% 
+  as.numeric 
+pt.mae.AR2.simpler.nhr= pt.mae.AR2.simpler.nhr[!is.na(pt.mae.AR2.simpler.nhr)]
+
+mean.mae.AR2.simpler.nhr = mean(pt.mae.AR2.simpler.nhr)
+print(paste0("MAE: ", round(mean.mae.AR2.simpler.nhr,4)))
+
+```
+```{r}
+mape.AR2.simpler.nhr <- data.mae %>% 
+  sapply(function(x) mape(x$NHR, x$mean))
+
+pt.mape.AR2.simpler.nhr <- str_remove_all(mape.AR2.simpler.nhr,"MAPE is ") %>% 
+  as.numeric 
+pt.mape.AR2.simpler.nhr = pt.mape.AR2.simpler.nhr[!is.na(pt.mape.AR2.simpler.nhr)]
+
+mean.mape.AR2.simpler.nhr = mean(pt.mape.AR2.simpler.nhr)
+print(paste0("MAPE: ", round(mean.mape.AR2.simpler.nhr,4)))
+
+```
+Variance of random intercepts
+```{r}
+sigma2.int.dist = inla.tmarginal(
+  fun = function(x)
+    exp(-x),
+  marginal = inla.mult.ar2.nhr$internal.marginals.hyperpar$`Log precision for numid (component 1)`
+)
+sigma2.int.zm = inla.zmarginal(sigma2.int.dist)
+```
+
+Variance of random slopes
+```{r}
+sigma2.slope.dist = inla.tmarginal(
+  fun = function(x)
+    exp(-x),
+  marginal = inla.mult.ar2.nhr$internal.marginals.hyperpar$`Log precision for numid (component 2)`
+)
+sigma2.slope.zm = inla.zmarginal(sigma2.slope.dist)
+```
+
+
+
+
+
