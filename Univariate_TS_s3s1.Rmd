@@ -1,0 +1,909 @@
+---
+title: "Univariate time series analysis"
+author: "Iliana Kleovoulou"
+date: "2023-04-28"
+output: html_document
+---
+
+In this report, we will explore the AR(1) and AR(2) models for the s3/S1 data. 
+We will extract the summary of the fitted models, check diagnostics and make a
+model comparison.
+
+```{r, echo=FALSE}
+library(INLA)
+library(dplyr)
+source("functions.R")
+library(hrbrthemes)
+library(gridExtra)
+library(tidyverse)
+library(hrbrthemes)
+```
+
+```{r}
+data = read.csv("Sensor_data3.csv", sep = ",")
+data$Alert = as.factor(data$Alert)
+data$Participant.Id = as.factor(data$Participant.Id)
+```
+
+# Autoregressive of order 1
+We run the AR(1) model with level and trend for one patient (one time series). 
+We remove the noise term.
+```{r}
+#subset data for patient 4.1
+data4 = data[data$Participant.Id == "4.1", ]
+
+# split the data of pt 4 to train and test
+n.train = 111
+n.hold = 5
+data4.split = data4[1:n.train,] # 111 observations for training
+nas = data.frame(matrix(NA,
+                        ncol = ncol(data4.split),
+                        nrow = n.hold))
+colnames(nas) = colnames(data4.split)
+data4.tr = rbind(data4.split, nas)
+
+n = nrow(data4.tr) # number of observations for patient 4
+pt4.x = data4.tr$time_new # with negative values 
+pt4.x2 = 1:n
+pt4.y = data4.tr$S3overS1
+data.ar1.pt4.train = cbind.data.frame(pt4.y, pt4.x, pt4.x2)
+
+modelformula = pt4.y ~ 1 + pt4.x +  f(pt4.x2, model = "ar1")
+                                          
+# fit ar(1) with train data
+modelfamily = "gaussian"
+patient4.ar1.tr = inla(formula = modelformula,
+                    data = data.ar1.pt4.train,
+                    family =  modelfamily,
+                    control.predictor = list(compute = TRUE),
+                    control.compute = list(dic = TRUE, waic = TRUE, cpo = TRUE),
+                    control.family = list(initial = 10, fixed=TRUE)
+                    )
+summary(patient4.ar1.tr)
+```
+
+Let's now transform the precision to standard deviation and the rho to phi using
+INLA's reverse transformation.
+
+Posterior marginal for state variance:
+```{r}
+sigma2.w.dist = inla.tmarginal(
+  fun = function(x)
+    exp(-x),
+  marginal = patient4.ar1.tr$internal.marginals.hyperpar$`Log precision for pt4.x2`
+)
+sigma2.w.zm = inla.zmarginal(sigma2.w.dist)
+```
+
+```{r}
+rho.dist = inla.tmarginal(
+  fun = function(x)
+    (exp(x) - 1) / (exp(x) + 1),
+  marginal = patient4.ar1.tr$internal.marginals.hyperpar$`Rho_intern for pt4.x2`
+)
+rho.zm = inla.zmarginal(rho.dist)
+```
+
+Model diagnostics:
+We closely inspect the residuals. First, we will check if there is autocorrelation 
+in the residuals. If the residuals are auto correlated it means that there is some
+information left over which should be accounted in the model. Then, we check the mean
+of the residuals (should be zero). 
+
+* Assumption 1: the residual are uncorrelated
+```{r}
+# first we take the mean of fitted values
+fit.ar1trend.pt4 = patient4.ar1.tr$summary.fitted.values$mean
+resid.ar1trend.pt4 = pt4.y - fit.ar1trend.pt4 # calculate residuals
+acf.ar1trend.pt4 = acf(resid.ar1trend.pt4, plot = T, na.action = na.pass)
+```
+
+```{r}
+ar.p <- 1
+fit.ar1 <- patient4.ar1.tr$summary.fitted.values$mean[(ar.p + 1):n.train]
+resid.ar1 = pt4.y[(ar.p + 1):n.train] - fit.ar1
+acf.ar1 <- acf(resid.ar1, plot = FALSE)
+plot(acf.ar1, main = "Model for pt4: AR(1) with level plus term", cex.main = 0.6)
+```
+From the autocorrelation function plot (the autocorrelation is on the y axis and 
+on the x axis is the lags) we can see that there is some auto correlation between 
+residuals at lag 1. Looking at the rest of the lags, it seems that the assumption
+is satisfied.
+
+* Assumption 2: The residuals have constant variance.
+We plot the residuals with time.
+```{r}
+plot(1:nrow(data4.tr), resid.ar1trend.pt4, type = "l", ylab = "residuals", xlab = "time")
+abline(h = 0, col = "blue", lty = 2)
+```
+* Assumption 3: The mean of residuals is zero.
+```{r}
+hist(resid.ar1trend.pt4, breaks = 10, main = "Histogram of residuals",
+     xlab = "residuals", col = "steelblue")
+```
+We can say that the residuals have mean 0.
+
+* Assumption 4: The residuals are normally distributed
+Plot the residuals vs fitted values.
+```{r}
+cbind(Fitted = fit.ar1trend.pt4,
+      Residuals = resid.ar1trend.pt4) %>%
+  as.data.frame() %>%
+  ggplot(aes(x=Fitted, y=Residuals)) + geom_point()
+```
+The residuals are not normally distributed. An upward trend can be noticed from the plot.
+
+Now, we fit the same model and run the same diagnostics for the data of another patient
+(pt 5). For that reason, we hide all the code as it is the same with the one showed above.
+
+```{r, echo=FALSE}
+#subset data for patient 5.1
+data5 = data[data$Participant.Id == "5.1", ]
+
+# split the data of pt 5 to train and test
+n.train = 176
+n.hold = 5
+data5.split = data5[1:n.train,]
+nas = data.frame(matrix(NA,
+                        ncol = ncol(data5.split),
+                        nrow = n.hold))
+colnames(nas) = colnames(data5.split)
+data5.tr = rbind(data5.split, nas)
+
+n = nrow(data5.tr) # number of observations for patient 5
+pt5.x = data5.tr$time_new # with negative values 
+pt5.x2 = 1:n
+pt5.y = data5.tr$S3overS1
+data.ar1.pt5.train = cbind.data.frame(pt5.y, pt5.x, pt5.x2)
+
+modelformula = pt5.y ~ 1 + pt5.x +  f(pt5.x2, model = "ar1")
+                                          
+# fit ar(1) with train data
+modelfamily = "gaussian"
+patient5.ar1.tr = inla(formula = modelformula,
+                    data = data.ar1.pt5.train,
+                    family =  modelfamily,
+                    control.predictor = list(compute = TRUE),
+                    control.compute = list(dic = TRUE, waic = TRUE, cpo = TRUE),
+                    control.family = list(initial = 10, fixed=TRUE)
+                    )
+
+summary(patient5.ar1.tr)
+```
+
+Lets transform the hyper-parameters.
+
+Posterior marginal for state standard deviation:
+```{r, echo=FALSE}
+sigma2.w.dist = inla.tmarginal(
+  fun = function(x)
+    exp(-x),
+  marginal = patient5.ar1.tr$internal.marginals.hyperpar$`Log precision for pt5.x2`
+)
+sigma2.w.zm = inla.zmarginal(sigma2.w.dist)
+
+```
+```{r, echo=FALSE}
+rho.dist = inla.tmarginal(
+  fun = function(x)
+    (exp(x) - 1) / (exp(x) + 1),
+  marginal = patient5.ar1.tr$internal.marginals.hyperpar$`Rho_intern for pt5.x2`
+)
+rho.zm = inla.zmarginal(rho.dist)
+```
+```{r, echo=FALSE}
+model.selection.criteria(patient5.ar1.tr)
+```
+
+Now, we can check the model diagnostics.
+* Assumption 1: the residual are uncorrelated
+```{r, echo=FALSE}
+# first we take the mean of fitted values
+fit.ar1trend.pt5 = patient5.ar1.tr$summary.fitted.values$mean
+resid.ar1trend.pt5 = pt5.y - fit.ar1trend.pt5 # calculate residuals
+acf.ar1trend.pt5 = acf(resid.ar1trend.pt5, plot = T, na.action = na.pass)
+```
+We can see some very small autocorrelation in lags 5,6 and 7. The autocorrelation
+is not particularly large so we can consider that the assumption is satisfied.
+
+* Assumption 2: The residuals have constant variance.
+We plot the residuals with time.
+```{r, echo=FALSE}
+plot(1:nrow(data5), resid.ar1trend.pt5, type = "l", ylab = "residuals", xlab = "time")
+abline(h = 0, col = "blue", lty = 2)
+```
+
+* Assumption 3: The mean of residuals is zero.
+```{r, echo=FALSE}
+hist(resid.ar1trend.pt5, breaks = 10, main = "Histogram of residuals",
+     xlab = "residuals", col = "steelblue")
+```
+
+* Assumption 4: The residuals are normally distributed
+Plot the residuals vs fitted values.
+```{r, echo=FALSE}
+cbind(Fitted = fit.ar1trend.pt5,
+      Residuals = resid.ar1trend.pt5) %>%
+  as.data.frame() %>%
+  ggplot(aes(x=Fitted, y=Residuals)) + geom_point()
+```
+
+The normality assumption is violated.
+
+We can fit this model to all the patients and extract their phis.
+
+```{r, echo=FALSE}
+ids = data$Participant.Id
+df = data.frame()
+rho = list()
+df.gof = data.frame()
+
+for (i in unique(ids)){
+  data.i = data[data$Participant.Id == i, ]
+
+  n = nrow(data.i) # number of observations 
+  
+  n.hold = 5
+  n.train = n - n.hold
+  train.df = data.i[1:n.train, ]
+  test.df = tail(data.i, n.hold)
+
+
+  x = train.df$time_new # with negative values 
+  x = c(x, rep(NA, n.hold)) # add NAs
+  x2 = 1:n
+
+  y = train.df$S3overS1
+  y = c(y, rep(NA, n.hold))
+
+  data.ar1.i = cbind.data.frame(y, x, x2)
+  
+  modelformula = y ~ 1 + x +  f(x2, model = "ar1")
+  modelfamily = "gaussian"
+  ar1 = inla(formula = modelformula,
+                      data = data.ar1.i,
+                      family =  modelfamily,
+                      control.predictor = list(compute = TRUE),
+                      control.compute = list(dic = TRUE, waic = TRUE, cpo = TRUE),
+                      control.family = list(initial = 10, fixed=TRUE)
+                      )
+  data.ar1.i$x = as.numeric(data.ar1.i$x)
+  fit = ar1$summary.fitted.values
+  
+  output.int = ar1$summary.fixed$mean[1]
+  output.trend = ar1$summary.fixed$mean[2]
+  output.coef = ar1$summary.hyperpar$mean[2]
+  
+  gof.dic = ar1$dic$dic
+  gof.waic = ar1$waic$waic
+  gof.ml = ar1$mlik
+  
+  sigma2.w.dist = inla.tmarginal(
+  fun = function(x)
+    exp(-x),
+  marginal = ar1$internal.marginals.hyperpar$`Log precision for x2`)
+  output.sigma2 = inla.zmarginal(sigma2.w.dist)$mean
+  
+  rho = append(rho, list(ar1$internal.marginals.hyperpar$`Rho_intern for x2`))
+  
+  output = c(output.int, output.trend, output.coef, output.sigma2)
+  output.gof = c(gof.dic, gof.waic, gof.ml)
+  
+  df = rbind(df, output)
+  df.gof = rbind(df.gof, output.gof)
+}
+colnames(df) = c("Level", "Trend", "AR coefficient", "StateVariance")
+df$ID = unique(ids)
+
+colnames(df.gof) = c("DIC", "WAIC", "ML1", "ML2")
+df.gof$ID = unique(ids)
+```
+
+```{r}
+mean(df.gof$DIC)
+mean(df.gof$WAIC)
+mean(df.gof$ML2)
+```
+
+```{r, echo=FALSE}
+# patients ids with alert
+alert.ids = c("4.1", "11.1", "12.1", "30.1", "51.1", "58.1", "68.1", 
+              "69.1", "89.1", "94.1", "95.1", "127.1")
+
+non.alerts.ids = c("5.1", "19.1", "20.6", "26.1", "32.1", "33.1", "35.1", "39.1",
+                   "46.1", "53.1", "54.1", "72.1", "76.1", "79.1", "84.1", "92.1",
+                   "109.1", "113.1", "20.1")
+df.alert = df[df$ID %in% alert.ids, ]
+df.nonalert = df[df$ID %in% non.alerts.ids,  ]
+
+df$alert = ifelse(df$ID %in% alert.ids, 1, 0)
+df$alert = as.factor(df$alert)
+
+```
+
+
+```{r}
+coefficients_long <- tidyr::pivot_longer(df[,1:4], cols = everything(), names_to = "Coefficient", values_to = "Value")
+
+# Calculate standard deviation for each coefficient
+sd_values <- coefficients_long %>%
+  group_by(Coefficient) %>%
+  summarise(sd = sd(Value))
+
+# Boxplot with standard deviation
+ggplot(coefficients_long, aes(x = Coefficient, y = Value)) +
+  geom_boxplot(fill = "#69b3a2", color = "#404040") +
+  stat_summary(fun = "mean", geom = "point", shape = 18, color = "red", size = 3) +
+  stat_summary(fun.data = "mean_sdl", fun.args = list(mult = 1), geom = "errorbar", width = 0.2, color = "red") +
+  labs(title = "Distribution of Coefficients of AR(1) model", y = "Coefficient") +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 16, face = "bold"),
+    axis.title.x = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    axis.title.y = element_text(size = 14),
+    axis.text.y = element_text(size = 12)
+  )
+
+```
+```{r}
+ggplot(coefficients_long, aes(x = reorder(Coefficient, -Value), y = Value)) +
+  geom_boxplot(fill = "#69b3a2", color = "#404040") +
+  stat_summary(fun = "mean", geom = "point", shape = 18, color = "red", size = 3) +
+  stat_summary(fun.data = "mean_sdl", fun.args = list(mult = 1), geom = "errorbar", width = 0.2, color = "red") +
+  labs(title = "Distribution of Coefficients of AR(1) model", y = "Coefficient") +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 16, face = "bold"),
+    axis.title.x = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    axis.title.y = element_text(size = 14),
+    axis.text.y = element_text(size = 12)
+  ) +
+  # Reorder the levels of the "Coefficient" variable to change the plot order
+  scale_x_discrete(limits = rev(levels(coefficients_long$Coefficient)))
+```
+
+# Autoregressive of order 2
+Now, we extend the model with the 2nd order. It means that the model now has 2
+phis, one associating y at t-1 and one associating y at t-2. INLA uses a transformation
+when p = 2 that is: 
+$$ \rho_1  = \phi_1/(1-\phi_2) $$ 
+and 
+$$ \rho_2 = \phi_2 $$
+We have then to use the inverse of these transformations to recover the estimates
+of phis.
+
+We will fit the model for one patient and then for the rest
+```{r}
+# for patient 4
+modelformula.ar2 = pt4.y ~ 1 + pt4.x +  f(pt4.x2, model = "ar", order = 2)
+                                          
+modelfamily = "gaussian"
+patient4.ar2.tr = inla(formula = modelformula.ar2,
+                    data = data.ar1.pt4.train,
+                    family =  modelfamily,
+                    control.predictor = list(compute = TRUE),
+                    control.compute = list(dic = TRUE, waic = TRUE, cpo = TRUE),
+                    control.family = list(initial = 10, fixed=TRUE)
+                    )
+summary(patient4.ar2.tr)
+```
+We transform to phis:
+```{r}
+# recover phis using the inverse transformation
+pacf = patient4.ar2.tr$summary.hyperpar$mean[2:3]
+phi = inla.ar.pacf2phi(pacf)
+print(phi)
+```
+
+```{r}
+# recover phis using the inverse transformation
+pacf = patient4.ar2.tr$summary.hyperpar$'0.025quant'[2:3]
+phi = inla.ar.pacf2phi(pacf)
+print(phi)
+```
+
+
+```{r}
+# recover phis using the inverse transformation
+pacf = patient4.ar2.tr$summary.hyperpar$'0.975quant'[2:3]
+phi = inla.ar.pacf2phi(pacf)
+print(phi)
+```
+
+```{r, echo=FALSE}
+psiwt.ar2 <- ARMAtoMA(ar = phi, ma = 0, 100)
+precision.x.hat <- patient4.ar2.tr$summary.hyperpar$mean[1]
+
+sigma2.w.hat <-
+  inla.emarginal(
+    fun = function(x)
+      exp(-x),
+    marginal = patient4.ar2.tr$internal.marginals.hyperpar$`Log precision for pt4.x2`
+  ) / sum(psiwt.ar2 ^ 2)
+
+cat(paste(
+  "Estimated state noise variance, sigma2.w",
+  round(sigma2.w.hat, 2),
+  sep = " = "
+),
+"\n")
+```
+
+```{r}
+sigma2.w.hat.t <-
+  inla.tmarginal(
+    fun = function(x)
+      exp(-x),
+    marginal = patient4.ar2.tr$internal.marginals.hyperpar$`Log precision for pt4.x2`
+  ) / sum(psiwt.ar2 ^ 2)
+
+a = inla.zmarginal(sigma2.w.hat.t)
+```
+
+
+Model diagnostics:
+* Assumption 1: the residual are uncorrelated
+```{r, echo=FALSE}
+fit.ar2trend.pt4 = patient4.ar2.tr$summary.fitted.values$mean
+resid.ar2trend.pt4 = pt4.y - fit.ar2trend.pt4
+acf.ar2trend.pt4 = acf(resid.ar2trend.pt4, plot = T, na.action = na.pass)
+```
+We have significant autocorrelation at lag 1.
+
+* Assumption 2: The residuals have constant variance.
+We plot the residuals with time.
+```{r, echo=FALSE}
+plot(1:nrow(data4), resid.ar2trend.pt4, type = "l", ylab = "residuals", xlab = "time")
+abline(h = 0, col = "blue", lty = 2)
+```
+
+* Assumption 3: The mean of residuals is zero.
+```{r, echo=FALSE}
+hist(resid.ar2trend.pt4, breaks = 10, main = "Histogram of residuals",
+     xlab = "residuals", col = "steelblue")
+```
+
+* Assumption 4: The residuals are normally distributed
+Plot the residuals vs fitted values.
+```{r, echo=FALSE}
+cbind(Fitted = fit.ar2trend.pt4,
+      Residuals = resid.ar2trend.pt4) %>%
+  as.data.frame() %>%
+  ggplot(aes(x=Fitted, y=Residuals)) + geom_point()
+```
+
+Lets fit the same model for patient 5 (alert-free).
+```{r}
+modelformula = pt5.y ~ 1 + pt5.x +  f(pt5.x2, model = "ar", order = 2)
+                                          
+modelfamily = "gaussian"
+patient5.ar2.tr = inla(formula = modelformula,
+                    data = data.ar1.pt5.train,
+                    family =  modelfamily,
+                    control.predictor = list(compute = TRUE),
+                    control.compute = list(dic = TRUE, waic = TRUE, cpo = TRUE),
+                    control.family = list(initial = 10, fixed=TRUE)
+                    )
+summary(patient5.ar2.tr)
+```
+Use inverse transformation to retrieve phis.
+```{r}
+# recover phis using the inverse transformation
+pacf = patient5.ar2.tr$summary.hyperpar$mean[2:3]
+phi = inla.ar.pacf2phi(pacf)
+print(phi)
+```
+
+
+Model diagnostics.
+* Assumption 1: the residual are uncorrelated
+```{r}
+fit.ar2trend.pt5 = patient5.ar2.tr$summary.fitted.values$mean
+resid.ar2trend.pt5 = pt5.y - fit.ar2trend.pt5
+acf.ar2trend = acf(resid.ar2trend.pt5, plot = T,na.action = na.pass)
+```
+Again lags 5,6,7 show some significant autocorrelation. 
+
+*  Assumption 2: The residuals have constant variance.
+We plot the residuals with time.
+```{r,echo=FALSE}
+plot(1:nrow(data5), resid.ar2trend.pt5, type = "l", ylab = "residuals", xlab = "time")
+abline(h = 0, col = "blue", lty = 2)
+```
+
+* Assumption 3: The mean of residuals is zero.
+```{r, echo=FALSE}
+hist(resid.ar2trend.pt5, breaks = 10, main = "Histogram of residuals",
+     xlab = "residuals", col = "steelblue")
+```
+
+* Assumption 4: The residuals are normally distributed
+Plot the residuals vs fitted values.
+```{r, echo=FALSE}
+cbind(Fitted = fit.ar2trend.pt5,
+      Residuals = resid.ar2trend.pt5) %>%
+  as.data.frame() %>%
+  ggplot(aes(x=Fitted, y=Residuals)) + geom_point()
+```
+
+Fit for all patients:
+```{r, echo=FALSE}
+ids = data$Participant.Id
+df = data.frame()
+state = list()
+rho1 = list()
+rho2 = list()
+df.gof = data.frame()
+for (i in unique(ids)){
+  data.i = data[data$Participant.Id == i, ]
+  data.i = data.i[data.i$time_new < 0,] # only the negative values
+  
+  n = nrow(data.i) # number of observations 
+  
+  n.hold = 5
+  n.train = n - n.hold
+  train.df = data.i[1:n.train, ]
+  test.df = tail(data.i, n.hold)
+
+
+  x = train.df$time_new # with negative values 
+  x = c(x, rep(NA, n.hold)) # add NAs
+  x2 = 1:n
+
+  y = train.df$S3overS1
+  y = c(y, rep(NA, n.hold))
+  
+  
+  x = data.i$time_new
+  x2 = 1:n 
+  y = data.i$S3overS1
+  data.ar2.i = cbind.data.frame(y, x, x2)
+  
+  modelformula = y ~ 1 + x +  f(x2, model = "ar", order = 2)
+  modelfamily = "gaussian"
+  ar2 = inla(formula = modelformula,
+                      data = data.ar2.i,
+                      family =  modelfamily,
+                      control.predictor = list(compute = TRUE),
+                      control.compute = list(dic = TRUE, waic = TRUE, cpo = TRUE),
+                      control.family = list(initial = 10, fixed=TRUE)
+                      )
+  
+  data.ar2.i$x = as.numeric(data.ar2.i$x)
+  fit = ar2$summary.fitted.values
+  
+  gof.dic = ar2$dic$dic
+  gof.waic = ar2$waic$waic
+  gof.ml = ar2$mlik
+  
+  sigma2.w.dist = inla.tmarginal(
+  fun = function(x)
+    exp(-x),
+  marginal = ar2$internal.marginals.hyperpar$`Log precision for x2`)
+  output.sigma2 = inla.zmarginal(sigma2.w.dist)$mean
+ 
+  
+  output.int = ar2$summary.fixed$mean[1]
+  output.trend = ar2$summary.fixed$mean[2]
+  output.coef1 = ar2$summary.hyperpar$mean[2]
+  output.coef2 = ar2$summary.hyperpar$mean[3]
+  
+  state = append(state,list(ar2$internal.marginals.hyperpar$`Log precision for x2`))
+  rho1 = append(rho1, list(ar2$internal.marginals.hyperpar$`Intern PACF1 for pt5.x2`))
+  rho2 = append(rho2, list(ar2$internal.marginals.hyperpar$`Intern PACF2 for pt5.x2`))
+
+  output = c(output.int, output.trend, output.coef1, output.coef2, output.sigma2)
+  output.gof = c(gof.dic, gof.waic, gof.ml)
+
+  df = rbind(df, output)
+  df.gof = rbind(df.gof, output.gof)
+}
+colnames(df) = c("Level", "Trend", "Rho1", "Rho2", "StateVariance")
+df$ID = unique(ids)
+
+colnames(df.gof) = c("DIC", "WAIC", "ML1", "ML2")
+df.gof$ID = unique(ids)
+```
+
+```{r}
+mean(df.gof$DIC)
+mean(df.gof$WAIC)
+mean(df.gof$ML2)
+```
+Now, we need to transform rho to phi.
+```{r, echo=FALSE}
+phis = inla.ar.pacf2phi(df[3:4])
+phis = as.data.frame(phis)
+colnames(phis) = c("Phi1", "Phi2")
+df = cbind(df, phis)
+
+df$alert = ifelse(df$ID %in% alert.ids, 1, 0)
+df$alert = as.factor(df$alert)
+```
+
+```{r}
+coefficients_long_AR2 <- tidyr::pivot_longer(df[,c(1,2,5,7,8)], cols = everything(), names_to = "Coefficient", values_to = "Value")
+
+
+# Calculate standard deviation for each coefficient
+sd_values_AR2 <- coefficients_long_AR2 %>%
+  group_by(Coefficient) %>%
+  summarise(sd = sd(Value))
+
+# Boxplot with standard deviation
+ggplot(coefficients_long_AR2, aes(x = Coefficient, y = Value)) +
+  geom_boxplot(fill = "#69b3a2", color = "#404040") +
+  stat_summary(fun = "mean", geom = "point", shape = 18, color = "red", size = 3) +
+  stat_summary(fun.data = "mean_sdl", fun.args = list(mult = 1), geom = "errorbar", width = 0.2, color = "red") +
+  labs(title = "Distribution of Coefficients of AR(2) model", y = "Coefficient") +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 16, face = "bold"),
+    axis.title.x = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    axis.title.y = element_text(size = 14),
+    axis.text.y = element_text(size = 12)
+  )
+
+```
+
+
+
+# In sample model comparison
+
+For patient 4: 
+Model selection:
+```{r}
+#DIC and WAIC for AR(1)
+dic.ar1 = patient4.ar1.tr$dic$dic
+waic.ar1 = patient4.ar1.tr$waic$waic
+cpo.ar1  = patient4.ar1.tr$cpo$cpo[!is.na(patient4.ar1.tr$cpo$cpo)]
+cpo = -sum(log(cpo.ar1))
+piti = patient4.ar1.tr$cpo$pit[!is.na(patient4.ar1.tr$cpo$pit)]
+pit=ks.test(piti,"punif",0,1)$statistic
+
+
+print(paste("dic =", round(dic.ar1,3),
+            "waic =", round(waic.ar1,3),
+            "cpo =", round(cpo,3),
+            "pit=", round(pit,3)
+            ))
+```
+
+
+```{r}
+mlik.ar1 = patient4.ar1.tr$mlik
+mlik.ar1
+```
+
+```{r}
+#DIC and WAIC for AR(2)
+
+dic.ar2 = patient4.ar2.tr$dic$dic
+waic.ar2 = patient4.ar2.tr$waic$waic
+cpo.ar2  = patient4.ar2.tr$cpo$cpo[!is.na(patient4.ar2.tr$cpo$cpo)]
+cpo.ar2 = -sum(log(cpo.ar2))
+piti = patient4.ar2.tr$cpo$pit[!is.na(patient4.ar2.tr$cpo$pit)]
+pit=ks.test(piti,"punif",0,1)$statistic
+
+print(paste("dic =", round(dic.ar2,3),
+            "waic =", round(waic.ar2,3),
+            "cpo =", round(cpo.ar2,3),
+            "pit=", round(pit,3)
+            ))
+```
+
+```{r}
+mlik.ar2 = patient4.ar2.tr$mlik
+mlik.ar2
+```
+For patient 5:
+```{r}
+#DIC and WAIC for AR(1)
+dic.ar1 = patient5.ar1.tr$dic$dic
+waic.ar1 = patient5.ar1.tr$waic$waic
+cpo.ar1  = patient5.ar1.tr$cpo$cpo[!is.na(patient5.ar1.tr$cpo$cpo)]
+cpo = -sum(log(cpo.ar1))
+
+print(paste("dic =", round(dic.ar1,2),
+            "waic =", round(waic.ar1,2),
+            "cpo =", round(cpo,2)
+            ))
+```
+```{r}
+mlik.ar1 = patient5.ar1.tr$mlik
+mlik.ar1
+```
+```{r}
+#DIC and WAIC for AR(2)
+dic.ar2 = patient5.ar2.tr$dic$dic
+waic.ar2 = patient5.ar2.tr$waic$waic
+cpo.ar2  = patient5.ar2.tr$cpo$cpo[!is.na(patient5.ar2.tr$cpo$cpo)]
+cpo = -sum(log(cpo.ar2))
+
+print(paste("dic =", round(dic.ar2,2),
+            "waic =", round(waic.ar2,2),
+            "cpo =", round(cpo,2)
+            ))
+```
+```{r}
+mlik.ar2 = patient5.ar2.tr$mlik
+mlik.ar2
+```
+
+
+# Forecasting
+First we, split the data into train and test. We set aside the 5 last repeated 
+measurements for patient 4 and we fill with NAs those rows. Then, we get the
+predictions and we plot the observed values along with the 5 forecasts.
+```{r, echo=FALSE}
+n.train = 111
+n.hold = 5
+fore =c(rep(NA, n.train),
+  tail(patient4.ar1.tr$summary.fitted.values$mean, n.hold))
+obs = data4$S3overS1
+fore.low <- c(
+  rep(NA, n.train),
+  tail(patient4.ar1.tr$summary.fitted.values$mean, n.hold) -
+    2 * tail(patient4.ar1.tr$summary.fitted.values$sd, n.hold)
+)
+fore.up <- c(
+  rep(NA, n.train),
+  tail(patient4.ar1.tr$summary.fitted.values$mean, n.hold) +
+    2 * tail(patient4.ar1.tr$summary.fitted.values$sd, n.hold)
+)
+
+plot.df <-
+  cbind.data.frame(time = 1:116, obs, fore, fore.low, fore.up)
+
+plot.ar1 = plot.df %>%
+  ggplot(aes(x = time)) +
+  geom_line(aes(y = obs), color = "#D55E00") +
+  geom_line(aes(y = fore), color = "#0072B2") +
+  geom_ribbon(aes(ymin = fore.low, ymax = fore.up), alpha =
+                .2) +
+  geom_vline(xintercept = n.train + 1,
+             ylab = "",
+             size = 0.2) +
+  xlab(label = "t") +
+  ylab(label = "S3/S1") +
+  ggtitle("AR(1) with level and trend model for patient 4")
+
+fore =c(rep(NA, n.train),
+  tail(patient4.ar2.tr$summary.fitted.values$mean, n.hold))
+obs = data4$S3overS1
+fore.low <- c(
+  rep(NA, n.train),
+  tail(patient4.ar2.tr$summary.fitted.values$mean, n.hold) -
+    2 * tail(patient4.ar2.tr$summary.fitted.values$sd, n.hold)
+)
+fore.up <- c(
+  rep(NA, n.train),
+  tail(patient4.ar2.tr$summary.fitted.values$mean, n.hold) +
+    2 * tail(patient4.ar2.tr$summary.fitted.values$sd, n.hold)
+)
+
+plot.df <-
+  cbind.data.frame(time = 1:116, obs, fore, fore.low, fore.up)
+plot.ar2 = plot.df %>%
+  ggplot(aes(x = time)) +
+  geom_line(aes(y = obs), color = "#D55E00") +
+  geom_line(aes(y = fore), color = "#0072B2") +
+  geom_ribbon(aes(ymin = fore.low, ymax = fore.up), alpha =
+                .2) +
+  geom_vline(xintercept = n.train + 1,
+             ylab = "",
+             size = 0.2) +
+  xlab(label = "t") +
+  ylab(label = "S3/S1") +
+  ggtitle("AR(2) with level and trend model for patient 4")
+
+
+grid.arrange(plot.ar1,plot.ar2)
+
+```
+
+MAE and MAPE
+```{r}
+mae.ar1 = mae(yhold = tail(data4$S3overS1,n.hold), 
+              yfore = tail(patient4.ar1.tr$summary.fitted.values$mean, n.hold))
+mape.ar1 = mape(yhold = tail(data4$S3overS1,n.hold), 
+              yfore = tail(patient4.ar1.tr$summary.fitted.values$mean, n.hold))
+print(paste("For AR(1) using data for pt.4 we have: ", mae.ar1, "and", mape.ar1))
+```
+
+```{r}
+mae.ar2 = mae(yhold = tail(data4$S3overS1,n.hold), 
+              yfore = tail(patient4.ar2.tr$summary.fitted.values$mean, n.hold))
+mape.ar2 = mape(yhold = tail(data4$S3overS1,n.hold), 
+              yfore = tail(patient4.ar2.tr$summary.fitted.values$mean, n.hold))
+print(paste("For AR(2) using data for pt.4 we have: ", mae.ar2, "and", mape.ar2))
+```
+
+Forecast for pt5:
+```{r}
+# split the data of pt 5 to train and test
+n.train = 176
+
+fore =c(rep(NA, n.train),
+  tail(patient5.ar1.tr$summary.fitted.values$mean, n.hold))
+obs = data5$S3overS1
+fore.low <- c(
+  rep(NA, n.train),
+  tail(patient5.ar1.tr$summary.fitted.values$mean, n.hold) -
+    2 * tail(patient5.ar1.tr$summary.fitted.values$sd, n.hold)
+)
+fore.up <- c(
+  rep(NA, n.train),
+  tail(patient5.ar1.tr$summary.fitted.values$mean, n.hold) +
+    2 * tail(patient5.ar1.tr$summary.fitted.values$sd, n.hold)
+)
+
+plot.df <-
+  cbind.data.frame(time = 1:181, obs, fore, fore.low, fore.up)
+
+plot.ar1.pt5 = plot.df %>%
+  ggplot(aes(x = time)) +
+  geom_line(aes(y = obs), color = "#D55E00") +
+  geom_line(aes(y = fore), color = "#0072B2") +
+  geom_ribbon(aes(ymin = fore.low, ymax = fore.up), alpha =
+                .2) +
+  geom_vline(xintercept = n.train + 1,
+             ylab = "",
+             size = 0.2) +
+  xlab(label = "t") +
+  ylab(label = expression(y[t])) +
+  ggtitle("AR(1) with level and trend model for pt5")
+
+fore =c(rep(NA, n.train),
+  tail(patient5.ar2.tr$summary.fitted.values$mean, n.hold))
+obs = data5$S3overS1
+fore.low <- c(
+  rep(NA, n.train),
+  tail(patient5.ar2.tr$summary.fitted.values$mean, n.hold) -
+    2 * tail(patient5.ar2.tr$summary.fitted.values$sd, n.hold)
+)
+fore.up <- c(
+  rep(NA, n.train),
+  tail(patient5.ar2.tr$summary.fitted.values$mean, n.hold) +
+    2 * tail(patient5.ar2.tr$summary.fitted.values$sd, n.hold)
+)
+
+plot.df <-
+  cbind.data.frame(time = 1:181, obs, fore, fore.low, fore.up)
+plot.ar2.pt5 = plot.df %>%
+  ggplot(aes(x = time)) +
+  geom_line(aes(y = obs), color = "#D55E00") +
+  geom_line(aes(y = fore), color = "#0072B2") +
+  geom_ribbon(aes(ymin = fore.low, ymax = fore.up), alpha =
+                .2) +
+  geom_vline(xintercept = n.train + 1,
+             ylab = "",
+             size = 0.2) +
+  xlab(label = "t") +
+  ylab(label = expression(y[t])) +
+  ggtitle("AR(2) with level and trend model for pt5")
+
+
+grid.arrange(plot.ar1.pt5,plot.ar2.pt5)
+```
+
+
+MAE and MAPE
+```{r}
+mae.ar1 = mae(yhold = tail(data5$S3overS1,n.hold), 
+              yfore = tail(patient5.ar1.tr$summary.fitted.values$mean, n.hold))
+mape.ar1 = mape(yhold = tail(data5$S3overS1,n.hold), 
+              yfore = tail(patient5.ar1.tr$summary.fitted.values$mean, n.hold))
+print(paste("For AR(1) using data for pt.5 we have: ", mae.ar1, "and", mape.ar1))
+```
+
+```{r}
+mae.ar2 = mae(yhold = tail(data5$S3overS1,n.hold), 
+              yfore = tail(patient5.ar2.tr$summary.fitted.values$mean, n.hold))
+mape.ar2 = mape(yhold = tail(data5$S3overS1,n.hold), 
+              yfore = tail(patient5.ar2.tr$summary.fitted.values$mean, n.hold))
+print(paste("For AR(2) using data for pt.5 we have: ", mae.ar2, "and", mape.ar2))
+```
