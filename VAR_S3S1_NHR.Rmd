@@ -1,0 +1,592 @@
+---
+title: "VAR"
+author: "Iliana Kleovoulou"
+date: "2023-06-19"
+output: html_document
+---
+# Gaussian Multivariate Time Series
+
+
+```{r, echo=FALSE}
+library("INLA")
+source("functions.R")
+library("dplyr")
+library("stringr") 
+library("lattice")
+library("car")
+library("mvtnorm")
+```
+
+```{r}
+data = read.csv("Sensor_data3.csv", sep = ",")
+data$Participant.Id = as.factor(data$Participant.Id)
+data$Alert = as.factor(data$Alert)
+```
+
+In this section we model Gaussian Multivariate Time Series. 
+We follow the section 12.1 of the time series book, and we fit
+2 time series using independent AR(1) processes. To do that, we must first
+create the indices which play an important role in the implementation of this model.
+This model is using univariate time series, so we use the data from one patient to fit it.
+```{r}
+# subset data for patient 4.1
+data.pt4 = data[data$Participant.Id == "4.1", ]
+n = nrow(data.pt4)
+n
+# create train and test set
+n.hold = 5
+n.train = n - n.hold
+train.df = data.pt4[1:n.train, ]
+test.df = tail(data.pt4, n.hold)
+
+N = 2*n
+```
+
+* First we need to create Y. Y is a vector contained the 2 dimensional time series,
+stacked one below the other so Y is a stacked vector of time series.
+* Then, we need to create two variables to denote the two intercepts, one for each sensor
+* And 2 AR(1) structures to account for the correlation of each sensor.
+* After that, we bind these columns together to create the data frame that we use for the model.
+```{r}
+# S3/S1 ratio
+S3S1.pt4 = train.df$S3overS1*100
+# Night Heart Rate
+NHR.pt4 = train.df$NightHeartRate
+
+# create the Y vector
+Y = c(c(S3S1.pt4, rep(NA, n.hold)), c(NHR.pt4, rep(NA, n.hold)))
+
+# intercepts
+alpha.S3S1 = c(rep(1,n), rep(NA,n))
+alpha.NHR = c(rep(NA,n), rep(1,n))
+
+# trends
+time.S3S1 <- c(data.pt4$time_new, rep(NA, n))
+time.NHR <- c(rep(NA, n), data.pt4$time_new)
+
+# AR(1) processes
+b0.S3S1 = c(1:n, rep(NA, n))
+b0.NHR = c(rep(NA, n), 1:n)
+
+# for covariance matrix
+t.index = 1:N
+pt4.mvn.data = cbind.data.frame(Y,
+                     alpha.S3S1, alpha.NHR,
+                     b0.S3S1, b0.NHR,
+                     time.S3S1, time.NHR,
+                     t.index)
+
+```
+
+Now we are able to fit the model:
+```{r}
+formula.mvn.pt4 = Y ~ -1 + alpha.S3S1 + alpha.NHR + time.S3S1 + time.NHR + 
+  f(t.index, model="iid2d", n=N) + 
+  f(b0.S3S1, model = "ar1") +
+  f(b0.NHR, model = "ar1")
+
+inla.mvn.pt4 = inla(formula = formula.mvn.pt4,
+                    family = c("gaussian"),
+                    data = pt4.mvn.data,
+                    control.inla = list(h = 1e-5, tolerance = 1e-3),
+                    control.compute = list(dic = TRUE,waic = TRUE, cpo = TRUE,config = TRUE),
+                    control.predictor = list(compute = TRUE),
+                    control.family =list(hyper = list(prec = list(initial = 10,fixed = TRUE))))
+result = inla.rerun(inla.mvn.pt4)
+summary(result)
+```
+```{r, echo=FALSE}
+library(brinla)
+bri.hyperpar.summary(result)
+```
+```{r}
+sigma.dist = inla.tmarginal(
+  fun = function(x)
+    exp(-x/2),
+  marginal = result$internal.marginals.hyperpar$`Log precision for b0.NHR`
+)
+sigma.zm = inla.zmarginal(sigma.dist)
+```
+Posteriors of hyper-parameters
+```{r, echo=FALSE}
+bri.hyperpar.plot(result, together = F)
+```
+```{r}
+model.sel.biv = model.selection.criteria(result)
+model.sel.biv
+```
+```{r, echo=FALSE}
+#CPO and PIT
+cpoi = result$cpo$cpo[!is.na(result$cpo$cpo)]
+cpo = -sum(log(cpoi))
+piti = result$cpo$pit[!is.na(result$cpo$pit)]
+pit=ks.test(piti,"punif",0,1)$statistic
+
+print(paste0("CPO: ", round(cpo,4)))
+print(paste0("PIT: ", round(pit,5)))
+```
+# Fitted values and forecast
+To extract the fitted values from the multivariate model, we can't just take the
+fitted values like we did before in the univariate case. Now we need to sample from
+the predictive distributions of the responses using the function inla.posterior.sample().
+This function provides M posterior samples for the model parameters and hyperparameters. 
+After we get those, we can simulate fitted responses for each 1,...,M samples.For each of the  
+2 sensors, the sample average of these  M fitted response values for each time  t
+constitutes a fitted time series, which can then be plotted against the observed values.
+
+```{r}
+post.sample = inla.posterior.sample(1000, result)
+```
+
+Here is a function to calculate the fitted values
+```{r}
+fit.post.sample = function(x) {
+  # firstly, we construct matrix V: V is a 2x2 covariance matrix 
+  sigma2.v1 = 1 / x$hyperpar[1] # marginal variance for u_1
+  sigma2.v2 = 1 / x$hyperpar[2] # marginal variance for u_2
+  rho.v1v2 = x$hyperpar[3] # correlation
+  cov.v1v2 = rho.v1v2 * sqrt(sigma2.v1) * sqrt(sigma2.v2) # covariance
+  sigma.v =
+    matrix(c(sigma2.v1, cov.v1v2, cov.v1v2, sigma2.v2), nrow = 2) # the covariance matrix
+  
+  # now we sample from the Multivariate Normal with mean 0 and covariance matrix the V
+  V = rmvnorm(n, mean = c(0, 0), sigma = sigma.v)
+  V1 = V[, 1] # first column for sensor 1 (S3/S1)
+  V2 = V[, 2] # second column for sensor 2 (NHR)
+  
+  # using the M posterior samples, we simulate fitted responses for the 2 time series
+  # For S3/S1
+  fit.S3S1 = x$latent[grep("alpha.S3S1", rownames(x$latent))] +
+    x$latent[grep("b0.S3S1", rownames(x$latent))] +
+    x$latent[grep("time.S3S1", rownames(x$latent))] * 
+    data.pt4$time_new +
+    V1
+  # for NHR
+  fit.NHR = x$latent[grep("alpha.NHR", rownames(x$latent))] +
+    x$latent[grep("b0.NHR", rownames(x$latent))] +
+    x$latent[grep("time.NHR", rownames(x$latent))] * 
+    data.pt4$time_new  +
+    V2
+  
+  return(list(fit.S3S1 = fit.S3S1, fit.NHR = fit.NHR))
+}
+```
+
+```{r}
+fits = post.sample %>%
+  lapply(function(x)
+    fit.post.sample(x))
+
+# then we average to get one fitted value for each time point.
+S3S1.fit = fits %>%
+  sapply(function(x)
+    x$fit.S3S1) %>% 
+  rowMeans()
+S3S1.fit = S3S1.fit/100
+NHR.fit = fits %>%
+  sapply(function(x)
+    x$fit.NHR) %>% 
+  rowMeans()
+```
+
+
+```{r, echo=FALSE}
+# the observed values
+S3S1.obs = data.pt4$S3overS1
+NHR.obs = data.pt4$NightHeartRate
+library(ggplot2)
+plot.df =
+  cbind.data.frame(time = 1:116, S3S1.obs, S3S1.fit)
+plot.pt4.S3S1 = plot.df %>%
+  ggplot(aes(x = time)) +
+  geom_line(aes(y = S3S1.obs), color = "#D55E00") +
+  geom_line(aes(y = S3S1.fit), color = "#0072B2") +
+  geom_vline(xintercept = n.train + 1,
+             ylab = "",
+             linewidth = 0.2) +
+  xlab(label = "days") +
+  ylab(label = "S3/S1") 
+plot.pt4.S3S1
+```
+
+
+
+
+```{r}
+n.train = n - n.hold
+fore =c(rep(NA, n.train),
+  tail(S3S1.fit, n.hold))
+obs = S3S1.obs
+fore.low <- c(
+  rep(NA, n.train),
+  tail(S3S1.fit, n.hold) -
+    2 * tail(S3S1.fit, n.hold)
+)
+fore.up <- c(
+  rep(NA, n.train),
+  tail(S3S1.fit, n.hold) +
+    2 * tail(S3S1.fit, n.hold)
+)
+
+plot.df <-
+  cbind.data.frame(time = 1:n, obs, fore, fore.low, fore.up)
+
+plot.S3S1.biv = plot.df %>%
+  ggplot(aes(x = time)) +
+  geom_line(aes(y = obs), color = "#D55E00") +
+  geom_line(aes(y = fore), color = "#0072B2") +
+  geom_ribbon(aes(ymin = fore.low, ymax = fore.up), alpha =
+                .2) +
+  geom_vline(xintercept = n.train + 1,
+             ylab = "",
+             size = 0.2) +
+  xlab(label = "t") +
+  ylab(label = expression(y[t])) +
+  ggtitle("")
+plot.S3S1.biv
+```
+
+```{r,echo=FALSE}
+plot.df =
+  cbind.data.frame(time = 1:116, NHR.obs, NHR.fit)
+plot.pt4.NHR = plot.df %>%
+  ggplot(aes(x = time)) +
+  geom_line(aes(y = NHR.obs), color = "#D55E00") +
+  geom_line(aes(y = NHR.fit), color = "#0072B2") +
+  geom_vline(xintercept = n.train + 1,
+             ylab = "",
+             linewidth = 0.2) +
+  xlab(label = "t") +
+  ylab(label = expression(y[t])) +
+  ggtitle("")
+  plot.pt4.NHR
+```
+
+```{r}
+fore =c(rep(NA, n.train),
+  tail(NHR.fit, n.hold))
+obs = NHR.obs
+fore.low <- c(
+  rep(NA, n.train),
+  tail(NHR.fit, n.hold) -
+     tail(NHR.fit, n.hold)
+)
+fore.up <- c(
+  rep(NA, n.train),
+  tail(NHR.fit, n.hold) +
+    tail(NHR.fit, n.hold)
+)
+
+plot.df <-
+  cbind.data.frame(time = 1:n, obs, fore, fore.low, fore.up)
+
+plot.NHR.biv = plot.df %>%
+  ggplot(aes(x = time)) +
+  geom_line(aes(y = obs), color = "#D55E00") +
+  geom_line(aes(y = fore), color = "#0072B2") +
+  geom_ribbon(aes(ymin = fore.low, ymax = fore.up), alpha =
+                .2) +
+  geom_vline(xintercept = n.train + 1,
+             ylab = "",
+             size = 0.2) +
+  xlab(label = "t") +
+  ylab(label = expression(y[t])) +
+  ggtitle("")
+plot.NHR.biv
+```
+In this plot, we see the sensor for NHR. With blue is the fitted values and with red 
+is the observed ones. Here, we see a better fit of the model as it follows nicely the 
+observed ones. In the test set (last five measurements after the vertical black line)
+we see a downward trend in the observed values which is also predicted from the model. 
+This is an indication that the model for this sensor does a good job!
+
+Lets calculate the MAE and MAPE for this model.
+For S3/S1
+```{r}
+predicted.S3S1 = S3S1.fit[112:116]
+test.S3S1 = test.df$S3overS1
+
+mae = mae(test.S3S1, predicted.S3S1)
+mae
+```
+
+```{r}
+mape = mape(test.S3S1, predicted.S3S1)
+mape
+```
+
+For NHR:
+```{r}
+predicted.NHR = NHR.fit[112:116]
+test.NHR = test.df$NightHeartRate
+
+mae = mae(test.NHR, predicted.NHR)
+mae
+```
+
+```{r}
+mape = mape(test.NHR, predicted.NHR)
+mape
+```
+
+
+# FIT AR(2)
+
+
+```{r}
+formula.mvn.pt4.ar2 = Y ~ -1 + alpha.S3S1 + alpha.NHR + time.S3S1 + time.NHR + 
+  f(t.index, model="iid2d", n=N) + 
+  f(b0.S3S1, model = "ar", order = 2) +
+  f(b0.NHR, model = "ar", order = 2)
+
+inla.mvn.pt4.ar2 = inla(formula = formula.mvn.pt4.ar2,
+                    family = c("gaussian"),
+                    data = pt4.mvn.data,
+                    control.inla = list(h = 1e-5, tolerance = 1e-3),
+                    control.compute = list(dic = TRUE,waic = TRUE, cpo = TRUE,config = TRUE),
+                    control.predictor = list(compute = TRUE),
+                    control.family =list(hyper = list(prec = list(initial = 10,fixed = TRUE))))
+result.ar2 = inla.rerun(inla.mvn.pt4.ar2)
+summary(result.ar2)
+```
+```{r}
+bri.hyperpar.summary(result.ar2)
+```
+```{r}
+sigma.dist = inla.tmarginal(
+  fun = function(x)
+    exp(-x/2),
+  marginal = result.ar2$marginals.hyperpar$`Precision for b0.NHR`
+)
+sigma.zm = inla.zmarginal(sigma.dist)
+
+```
+```{r}
+# recover phis using the inverse transformation
+pacf = result.ar2$summary.hyperpar$mean[5:6]
+phi = inla.ar.pacf2phi(pacf)
+print(phi)
+```
+```{r}
+# recover phis using the inverse transformation
+pacf = result.ar2$summary.hyperpar$mean[8:9]
+phi = inla.ar.pacf2phi(pacf)
+print(phi)
+phi
+```
+```{r}
+model.selection.criteria(result.ar2)
+```
+```{r}
+#CPO and PIT
+cpoi = result.ar2$cpo$cpo[!is.na(result.ar2$cpo$cpo)]
+cpo = -sum(log(cpoi))
+piti = result.ar2$cpo$pit[!is.na(result.ar2$cpo$pit)]
+pit=ks.test(piti,"punif",0,1)$statistic
+
+print(paste0("CPO: ", round(cpo,4)))
+print(paste0("PIT: ", round(pit,5)))
+```
+
+```{r}
+post.sample = inla.posterior.sample(1000, result.ar2)
+```
+
+Here is a function to calculate the fitted values
+```{r}
+fit.post.sample = function(x) {
+  # firstly, we construct matrix V: V is a 2x2 covariance matrix 
+  sigma2.v1 = 1 / x$hyperpar[1] # marginal variance for u_1
+  sigma2.v2 = 1 / x$hyperpar[2] # marginal variance for u_2
+  rho.v1v2 = x$hyperpar[3] # correlation
+  cov.v1v2 = rho.v1v2 * sqrt(sigma2.v1) * sqrt(sigma2.v2) # covariance
+  sigma.v =
+    matrix(c(sigma2.v1, cov.v1v2, cov.v1v2, sigma2.v2), nrow = 2) # the covariance matrix
+  
+  # now we sample from the Multivariate Normal with mean 0 and covariance matrix the V
+  V = rmvnorm(n, mean = c(0, 0), sigma = sigma.v)
+  V1 = V[, 1] # first column for sensor 1 (S3/S1)
+  V2 = V[, 2] # second column for sensor 2 (NHR)
+  
+  # using the M posterior samples, we simulate fitted responses for the 2 time series
+  # For S3/S1
+  fit.S3S1 = x$latent[grep("alpha.S3S1", rownames(x$latent))] +
+    x$latent[grep("b0.S3S1", rownames(x$latent))] +
+    x$latent[grep("time.S3S1", rownames(x$latent))] * 
+    data.pt4$time_new +
+    V1
+  # for NHR
+  fit.NHR = x$latent[grep("alpha.NHR", rownames(x$latent))] +
+    x$latent[grep("b0.NHR", rownames(x$latent))] +
+    x$latent[grep("time.NHR", rownames(x$latent))] * 
+    data.pt4$time_new  +
+    V2
+  
+  return(list(fit.S3S1 = fit.S3S1, fit.NHR = fit.NHR))
+}
+```
+
+```{r}
+fits = post.sample %>%
+  lapply(function(x)
+    fit.post.sample(x))
+
+# then we average to get one fitted value for each time point.
+S3S1.fit = fits %>%
+  sapply(function(x)
+    x$fit.S3S1) %>% 
+  rowMeans()
+S3S1.fit = S3S1.fit/100
+NHR.fit = fits %>%
+  sapply(function(x)
+    x$fit.NHR) %>% 
+  rowMeans()
+```
+
+```{r, echo=FALSE}
+# the observed values
+S3S1.obs = data.pt4$S3overS1
+NHR.obs = data.pt4$NightHeartRate
+plot.df =
+  cbind.data.frame(time = 1:116, S3S1.obs, S3S1.fit)
+plot.pt4.S3S1.ar2 = plot.df %>%
+  ggplot(aes(x = time)) +
+  geom_line(aes(y = S3S1.obs), color = "#D55E00") +
+  geom_line(aes(y = S3S1.fit), color = "#0072B2") +
+  geom_vline(xintercept = n.train + 1,
+             ylab = "",
+             linewidth = 0.2) +
+  xlab(label = "days") +
+  ylab(label = "S3/S1") 
+plot.pt4.S3S1.ar2
+```
+```{r,echo=FALSE}
+plot.df =
+  cbind.data.frame(time = 1:116, NHR.obs, NHR.fit)
+plot.pt4.NHR = plot.df %>%
+  ggplot(aes(x = time)) +
+  geom_line(aes(y = NHR.obs), color = "#D55E00") +
+  geom_line(aes(y = NHR.fit), color = "#0072B2") +
+  geom_vline(xintercept = n.train + 1,
+             ylab = "",
+             linewidth = 0.2) +
+  xlab(label = "t") +
+  ylab(label = expression(y[t])) +
+  ggtitle("")
+  plot.pt4.NHR
+```
+
+```{r}
+predicted.S3S1 = S3S1.fit[112:116]
+test.S3S1 = test.df$S3overS1
+mae = mae(test.S3S1, predicted.S3S1)
+mae
+```
+
+```{r}
+mape = mape(test.S3S1, predicted.S3S1)
+mape
+```
+For NHR:
+```{r}
+predicted.NHR = NHR.fit[112:116]
+test.NHR = test.df$NightHeartRate
+mae = mae(test.NHR, predicted.NHR)
+mae
+```
+
+```{r}
+mape = mape(test.NHR, predicted.NHR)
+mape
+```
+
+# fit for all patients
+```{r, echo=FALSE}
+ids = data$Participant.Id
+df = data.frame()
+state.S3S1 = list()
+state.NHR = list()
+df.gof = data.frame()
+for (i in unique(ids)){
+  data.i = data[data$Participant.Id == i, ]
+  data.i = data.i[data.i$time_new < 0,] # only the negative values
+  
+  n = nrow(data.i) # number of observations 
+  N = 2*n
+  n.hold = 5
+  n.train = n - n.hold
+  train.df = data.i[1:n.train, ]
+  test.df = tail(data.i, n.hold)
+
+  # S3/S1 ratio
+  S3S1.pti = train.df$S3overS1*100
+  # Night Heart Rate
+  NHR.pti = train.df$NightHeartRate
+  
+  # create the Y vector
+  Y = c(c(S3S1.pti, rep(NA, n.hold)), c(NHR.pti, rep(NA, n.hold)))
+  
+  # intercepts
+  alpha.S3S1 = c(rep(1,n), rep(NA,n))
+  alpha.NHR = c(rep(NA,n), rep(1,n))
+  
+  # trends
+  time.S3S1 <- c(data.i$time_new, rep(NA, n))
+  time.NHR <- c(rep(NA, n), data.i$time_new)
+  
+  # AR(1) processes
+  b0.S3S1 = c(1:n, rep(NA, n))
+  b0.NHR = c(rep(NA, n), 1:n)
+  
+  # for covariance matrix
+  t.index = 1:N
+  pti.mvn.data = cbind.data.frame(Y,
+                       alpha.S3S1, alpha.NHR,
+                       b0.S3S1, b0.NHR,
+                       time.S3S1, time.NHR,
+                       t.index)
+  
+  formula.mvn.pti = Y ~ -1 + alpha.S3S1 + alpha.NHR + time.S3S1 + time.NHR + 
+  f(t.index, model="iid2d", n=N) + 
+  f(b0.S3S1, model = "ar1") +
+  f(b0.NHR, model = "ar1")
+
+  inla.mvn.pti = inla(formula = formula.mvn.pti,
+                      family = c("gaussian"),
+                      data = pt4.mvn.data,
+                      control.inla = list(h = 1e-5, tolerance = 1e-3),
+                      control.compute = list(dic = TRUE,waic = TRUE, cpo = TRUE,config = TRUE),
+                      control.predictor = list(compute = TRUE),
+                      control.family =list(hyper = list(prec = list(initial = 10,fixed = TRUE))))
+  result = inla.rerun(inla.mvn.pti)
+
+
+  gof.dic = result$dic$dic
+  gof.waic = result$waic$waic
+  gof.ml = result$mlik
+  
+  output.int.S3S1 = ar2$summary.fixed$mean[1]
+  output.int.NHR = ar2$summary.fixed$mean[2]
+  
+  output.slope.S3S1 = ar2$summary.fixed$mean[3]
+  output.slope.NHR = ar2$summary.fixed$mean[4]
+  
+  output.ar1.S3S1 = ar2$summary.hyperpar$mean[5]
+  output.ar1.NHR = ar2$summary.hyperpar$mean[7]
+  
+  state.S3S1 = append(state.S3S1,list(result$internal.marginals.hyperpar$`Log precision for b0.S3S1`))
+  state.NHR = append(state.NHR,list(result$internal.marginals.hyperpar$`Log precision for b0.NHR`))
+
+  
+  output = c(output.int.S3S1, output.int.NHR, output.slope.S3S1, output.slope.NHR, output.ar1.S3S1, output.ar1.NHR)
+  output.gof = c(gof.dic, gof.waic, gof.ml)
+
+  df = rbind(df, output)
+  df.gof = rbind(df.gof, output.gof)
+}
+colnames(df) = c("Level_S3S1", "Level_NHR", "Trend_S3S1", "Trend_NHR", "AR1_S3S1", "AR1_NHR")
+df$ID = unique(ids)
+
+colnames(df.gof) = c("DIC", "WAIC", "ML1", "ML2")
+df.gof$ID = unique(ids)
+```
