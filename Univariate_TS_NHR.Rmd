@@ -1,0 +1,644 @@
+---
+title: "Univariate Time Series for NHR"
+author: "Iliana Kleovoulou"
+date: "2023-05-26"
+output: html_document
+---
+
+```{r, echo=FALSE}
+library(INLA)
+library(brinla)
+library(dplyr)
+source("functions.R")
+library(hrbrthemes)
+library(gridExtra)
+```
+
+Import data:
+```{r}
+data = read.csv("Sensor_data3.csv", sep = ",")
+data$Alert = as.factor(data$Alert)
+data$Participant.Id = as.factor(data$Participant.Id)
+```
+
+```{r}
+#subset data for patient 4.1
+data4 = data[data$Participant.Id == "4.1", ]
+n = nrow(data4)
+# create train and test set
+n.hold = 5
+n.train = n - n.hold
+train.df = data4[1:n.train, ]
+test.df = tail(data4, n.hold)
+
+
+pt4.x = train.df$time_new # with negative values 
+pt4.x = c(pt4.x, rep(NA, n.hold)) # add NAs
+
+pt4.x2 = 1:n
+
+pt4.y = train.df$NightHeartRate
+pt4.y = c(pt4.y, rep(NA, n.hold))
+
+data.ar1.pt4 = cbind.data.frame(pt4.y, pt4.x, pt4.x2)
+
+modelformula = pt4.y ~ 1 + pt4.x +  f(pt4.x2, model = "ar1")
+p4.ar1.NHR = inla(formula = modelformula,
+                    data = data.ar1.pt4,
+                    family =  "gaussian",
+                    control.predictor = list(compute = TRUE),
+                    control.compute = list(dic = TRUE, waic = TRUE, cpo = TRUE),
+                    control.family = list(initial = 10, fixed=TRUE)
+                    )
+summary(p4.ar1.NHR)
+```
+
+
+```{r}
+sigma2.w.dist = inla.tmarginal(
+  fun = function(x)
+    exp(-x),
+  marginal = p4.ar1.NHR$internal.marginals.hyperpar$`Log precision for pt4.x2`
+)
+sigma2.w.zm = inla.zmarginal(sigma2.w.dist)
+```
+
+```{r}
+model.selection.criteria(p4.ar1.NHR)
+```
+````{r}
+p4.ar1.NHR$mlik
+````
+
+```{r}
+#CPO and PIT
+cpoi = p4.ar1.NHR$cpo$cpo[!is.na(p4.ar1.NHR$cpo$cpo)]
+cpo = -sum(log(cpoi))
+piti = p4.ar1.NHR$cpo$pit[!is.na(p4.ar1.NHR$cpo$pit)]
+pit=ks.test(piti,"punif",0,1)$statistic
+
+print(paste0("CPO: ", round(cpo,4)))
+print(paste0("PIT: ", round(pit,5)))
+```
+
+
+Check for autocorrelation in residuals:
+```{r}
+fit.ar1.p4.NHR = p4.ar1.NHR$summary.fitted.values$mean
+resid.ar1.pt4.NHR = pt4.y - fit.ar1.p4.NHR # calculate residuals
+
+acf.ar1.pt4.NHR = acf(resid.ar1.pt4.NHR, plot = T,na.action = na.pass)
+```
+
+Now we fit for another patient (patient 5) which belongs to the non alert group
+
+```{r}
+#subset data for patient 4.1
+data5 = data[data$Participant.Id == "5.1", ]
+data5 = data5[data5$time_new < 0,]
+n = nrow(data5)
+# create train and test set
+n.hold = 5
+n.train = n - n.hold
+train.df = data5[1:n.train, ]
+test.df = tail(data5, n.hold)
+
+
+pt5.x = train.df$time_new # with negative values 
+pt5.x = c(pt5.x, rep(NA, n.hold)) # add NAs
+
+pt5.x2 = 1:n
+
+pt5.y = train.df$NightHeartRate
+pt5.y = c(pt5.y, rep(NA, n.hold))
+
+data.ar1.pt5 = cbind.data.frame(pt5.y, pt5.x, pt5.x2)
+
+modelformula = pt5.y ~ 1 + pt5.x +  f(pt5.x2, model = "ar1")
+p5.ar1.NHR = inla(formula = modelformula,
+                    data = data.ar1.pt5,
+                    family =  "gaussian",
+                    control.predictor = list(compute = TRUE),
+                    control.compute = list(dic = TRUE, waic = TRUE, cpo = TRUE),
+                    control.family = list(initial = 10, fixed=TRUE)
+                    )
+summary(p5.ar1.NHR)
+```
+
+```{r}
+model.selection.criteria(p5.ar1.NHR)
+```
+```{r, echo=FALSE}
+#CPO and PIT
+cpoi = p5.ar1.NHR$cpo$cpo[!is.na(p5.ar1.NHR$cpo$cpo)]
+cpo = -sum(log(cpoi))
+piti = p5.ar1.NHR$cpo$pit[!is.na(p5.ar1.NHR$cpo$pit)]
+pit=ks.test(piti,"punif",0,1)$statistic
+
+print(paste0("CPO: ", round(cpo,4)))
+print(paste0("PIT: ", round(pit,5)))
+```
+
+Check for autocorrelation in residuals:
+```{r}
+fit.ar1.p5.NHR = p5.ar1.NHR$summary.fitted.values$mean
+resid.ar1.pt5.NHR = pt5.y - fit.ar1.p5.NHR # calculate residuals
+
+acf.ar1.pt5.NHR = acf(resid.ar1.pt5.NHR, plot = T,na.action = na.pass)
+```
+Fit this model to all patients (30 separated models) and extract their coefficients.
+
+```{r, echo=FALSE}
+ids = data$Participant.Id
+df = data.frame()
+state = list()
+rho = list()
+
+for (i in unique(ids)){
+  data.i = data[data$Participant.Id == i, ]
+  data.i = data.i[data.i$time_new < 0,] # only the negative values
+  
+  n = nrow(data.i) # number of observations 
+  
+  n.hold = 5
+  n.train = n - n.hold
+  train.df = data.i[1:n.train, ]
+  test.df = tail(data.i, n.hold)
+
+
+  x = train.df$time_new # with negative values 
+  x = c(x, rep(NA, n.hold)) # add NAs
+  x2 = 1:n
+
+  y = train.df$NightHeartRate
+  y = c(y, rep(NA, n.hold))
+
+  data.ar1.i = cbind.data.frame(y, x, x2)
+  
+  modelformula = y ~ 1 + x +  f(x2, model = "ar1")
+  modelfamily = "gaussian"
+  ar1 = inla(formula = modelformula,
+                      data = data.ar1.i,
+                      family =  modelfamily,
+                      control.predictor = list(compute = TRUE),
+                      control.compute = list(dic = TRUE, waic = TRUE, cpo = TRUE),
+                      control.family = list(initial = 10, fixed=TRUE)
+                      )
+  
+  data.ar1.i$x = as.numeric(data.ar1.i$x)
+  fit = ar1$summary.fitted.values
+  
+  sigma2.w.dist = inla.tmarginal(
+  fun = function(x)
+    exp(-x),
+  marginal = ar1$internal.marginals.hyperpar$`Log precision for x2`)
+  output.sigma2 = inla.zmarginal(sigma2.w.dist)$mean
+ 
+  
+  output.int = ar1$summary.fixed$mean[1]
+  output.trend = ar1$summary.fixed$mean[2]
+  output.coef = ar1$summary.hyperpar$mean[2]
+  
+  state = append(state,list(ar1$internal.marginals.hyperpar$`Log precision for x2`))
+  rho = append(rho, list(ar1$internal.marginals.hyperpar$`Rho_intern for x2`))
+  
+  output = c(output.int, output.trend, output.coef, output.sigma2)
+  
+  df = rbind(df, output)
+}
+colnames(df) = c("Level", "Trend", "AR coefficient", "StateVariance")
+df$ID = unique(ids)
+```
+
+```{r, echo=FALSE}
+# patients ids with alert
+alert.ids = c("4.1", "11.1", "12.1", "30.1", "51.1", "58.1", "68.1", 
+              "69.1", "89.1", "94.1", "95.1", "127.1")
+
+non.alerts.ids = c("5.1", "19.1", "20.6", "26.1", "32.1", "33.1", "35.1", "39.1",
+                   "46.1", "53.1", "54.1", "72.1", "76.1", "79.1", "84.1", "92.1",
+                   "109.1", "113.1", "20.1")
+df.alert = df[df$ID %in% alert.ids, ]
+df.nonalert = df[df$ID %in% non.alerts.ids,  ]
+```
+
+```{r, echo=FALSE}
+df$alert = ifelse(df$ID %in% alert.ids, 1, 0)
+df$alert = as.factor(df$alert)
+```
+
+```{r}
+coefficients_long_nhr <- tidyr::pivot_longer(df[,1:4], cols = everything(), names_to = "Coefficient", values_to = "Value")
+
+
+# Calculate mean and median for each coefficient
+summary_stats <- coefficients_long_nhr %>%
+  group_by(Coefficient) %>%
+  summarise(Mean = mean(Value),
+            Median = median(Value),
+            CI_lower = quantile(Value, 0.025),
+            CI_upper = quantile(Value, 0.975))
+ 
+summary_stats
+```
+
+Now we can fit Autoregressive of order 2:
+```{r}
+# for patient 4
+modelformula.ar2 = pt4.y ~ 1 + pt4.x +  f(pt4.x2, model = "ar", order = 2)
+                                          
+patient4.ar2 = inla(formula = modelformula.ar2,
+                    data = data.ar1.pt4,
+                    family =  "gaussian",
+                    control.predictor = list(compute = TRUE),
+                    control.compute = list(dic = TRUE, waic = TRUE, cpo = TRUE),
+                    control.family = list(initial = 10, fixed=TRUE)
+                    )
+summary(patient4.ar2)
+```
+```{r}
+pacf = patient4.ar2$summary.hyperpar$mean[2:3]
+phi = inla.ar.pacf2phi(pacf)
+print(phi)
+```
+```{r}
+pacf = patient4.ar2$summary.hyperpar$'0.025quant'[2:3]
+phi = inla.ar.pacf2phi(pacf)
+print(phi)
+```
+```{r}
+pacf = patient4.ar2$summary.hyperpar$'0.975quant'[2:3]
+phi = inla.ar.pacf2phi(pacf)
+print(phi)
+```
+
+
+
+```{r, echo=FALSE}
+psiwt.ar2 <- ARMAtoMA(ar = phi, ma = 0, 100)
+precision.x.hat <- patient4.ar2$summary.hyperpar$mean[1]
+
+sigma2.w.hat <-
+  inla.emarginal(
+    fun = function(x)
+      exp(-x),
+    marginal = patient4.ar2$internal.marginals.hyperpar$`Log precision for pt4.x2`
+  ) / sum(psiwt.ar2 ^ 2)
+
+cat(paste(
+  "Estimated state noise variance, sigma2.w",
+  round(sigma2.w.hat, 3),
+  sep = " = "
+),
+"\n")
+```
+```{r}
+sigma2.w.hat.t <-
+  inla.tmarginal(
+    fun = function(x)
+      exp(-x),
+    marginal = patient4.ar2$internal.marginals.hyperpar$`Log precision for pt4.x2`
+  ) / sum(psiwt.ar2 ^ 2)
+
+a = inla.zmarginal(sigma2.w.hat.t)
+```
+
+```{r}
+model.selection.criteria(patient4.ar2)
+```
+
+
+```{r, echo=FALSE}
+#CPO and PIT
+cpoi = patient4.ar2$cpo$cpo[!is.na(patient4.ar2$cpo$cpo)]
+cpo = -sum(log(cpoi))
+piti = patient4.ar2$cpo$pit[!is.na(patient4.ar2$cpo$pit)]
+pit=ks.test(piti,"punif",0,1)$statistic
+
+print(paste0("CPO: ", round(cpo,4)))
+print(paste0("PIT: ", round(pit,5)))
+```
+Check residuals:
+```{r, echo=FALSE}
+fit.ar2trend.pt4 = patient4.ar2$summary.fitted.values$mean
+resid.ar2trend.pt4 = pt4.y - fit.ar2trend.pt4
+acf.ar2trend.pt4 = acf(resid.ar2trend.pt4, plot = T, na.action = na.pass)
+```
+Fit for alert free patients:
+```{r}
+modelformula = pt5.y ~ 1 + pt5.x +  f(pt5.x2, model = "ar", order = 2)
+                                          
+modelfamily = "gaussian"
+patient5.ar2 = inla(formula = modelformula,
+                    data = data.ar1.pt5,
+                    family =  modelfamily,
+                    control.predictor = list(compute = TRUE),
+                    control.compute = list(dic = TRUE, waic = TRUE, cpo = TRUE),
+                    control.family = list(initial = 10, fixed=TRUE)
+                    )
+summary(patient5.ar2)
+```
+
+```{r}
+model.selection.criteria(patient5.ar2)
+```
+```{r, echo=FALSE}
+#CPO and PIT
+cpoi = patient5.ar2$cpo$cpo[!is.na(patient5.ar2$cpo$cpo)]
+cpo = -sum(log(cpoi))
+piti = patient5.ar2$cpo$pit[!is.na(patient5.ar2$cpo$pit)]
+pit=ks.test(piti,"punif",0,1)$statistic
+
+print(paste0("CPO: ", round(cpo,4)))
+print(paste0("PIT: ", round(pit,5)))
+```
+Use inverse transformation to retrieve phis.
+```{r}
+# recover phis using the inverse transformation
+pacf = patient5.ar2$summary.hyperpar$mean[2:3]
+phi = inla.ar.pacf2phi(pacf)
+print(phi)
+```
+
+```{r}
+fit.ar2trend.pt5 = patient5.ar2$summary.fitted.values$mean
+resid.ar2trend.pt5 = pt5.y - fit.ar2trend.pt5
+acf.ar2trend = acf(resid.ar2trend.pt5, plot = T, na.action = na.pass)
+```
+Now we can fit for all patients:
+
+```{r, echo=FALSE}
+ids = data$Participant.Id
+df = data.frame()
+state = list()
+rho1 = list()
+rho2 = list()
+
+for (i in unique(ids)){
+  data.i = data[data$Participant.Id == i, ]
+  data.i = data.i[data.i$time_new < 0,] # only the negative values
+  
+  n = nrow(data.i) # number of observations 
+  
+  n.hold = 5
+  n.train = n - n.hold
+  train.df = data.i[1:n.train, ]
+  test.df = tail(data.i, n.hold)
+
+
+  x = train.df$time_new # with negative values 
+  x = c(x, rep(NA, n.hold)) # add NAs
+  x2 = 1:n
+
+  y = train.df$NightHeartRate
+  y = c(y, rep(NA, n.hold))
+
+  data.ar2.i = cbind.data.frame(y, x, x2)
+  
+  modelformula = y ~ 1 + x +  f(x2, model = "ar", order = 2)
+  modelfamily = "gaussian"
+  ar2 = inla(formula = modelformula,
+                      data = data.ar2.i,
+                      family =  modelfamily,
+                      control.predictor = list(compute = TRUE),
+                      control.compute = list(dic = TRUE, waic = TRUE, cpo = TRUE),
+                      control.family = list(initial = 10, fixed=TRUE)
+                      )
+  
+  data.ar2.i$x = as.numeric(data.ar2.i$x)
+  fit = ar2$summary.fitted.values
+  
+  sigma2.w.dist = inla.tmarginal(
+  fun = function(x)
+    exp(-x),
+  marginal = ar2$internal.marginals.hyperpar$`Log precision for x2`)
+  output.sigma2 = inla.zmarginal(sigma2.w.dist)$mean
+ 
+  
+  output.int = ar2$summary.fixed$mean[1]
+  output.trend = ar2$summary.fixed$mean[2]
+  output.coef1 = ar2$summary.hyperpar$mean[2]
+  output.coef2 = ar2$summary.hyperpar$mean[3]
+  
+  
+  state = append(state,list(ar2$internal.marginals.hyperpar$`Log precision for x2`))
+  rho1 = append(rho1, list(ar2$internal.marginals.hyperpar$`Intern PACF1 for pt5.x2`))
+  rho2 = append(rho2, list(ar2$internal.marginals.hyperpar$`Intern PACF2 for pt5.x2`))
+
+  output = c(output.int, output.trend, output.coef1, output.coef2, output.sigma2)
+  
+  df = rbind(df, output)
+}
+colnames(df) = c("Level", "Trend", "Rho1", "Rho2", "StateVariance")
+df$ID = unique(ids)
+```
+
+We need to transform phis:
+```{r}
+phis = inla.ar.pacf2phi(df[3:4])
+phis = as.data.frame(phis)
+colnames(phis) = c("Phi1", "Phi2")
+df = cbind(df, phis)
+
+```
+
+Summary of the results
+```{r}
+coefficients_long_nhr_ar2 <- tidyr::pivot_longer(df[,c(1,2,5,7,8)], cols = everything(), names_to = "Coefficient", values_to = "Value")
+
+# Calculate mean and median for each coefficient
+summary_stats_ar2 <- coefficients_long_nhr_ar2 %>%
+  group_by(Coefficient) %>%
+  summarise(Mean = mean(Value),
+            Median = median(Value),
+            CI_lower = quantile(Value, 0.025),
+            CI_upper = quantile(Value, 0.975))
+ 
+summary_stats_ar2
+
+```
+
+
+Forecasting:
+First we do forecasting for patient 4 for AR(1) model and AR(2) model
+```{r, echo=FALSE}
+n = nrow(data4)
+n.hold = 5
+n.train = n - n.hold
+
+fore =c(rep(NA, n.train),
+  tail(p4.ar1.NHR$summary.fitted.values$mean, n.hold))
+obs = data4$NightHeartRate
+fore.low <- c(
+  rep(NA, n.train),
+  tail(p4.ar1.NHR$summary.fitted.values$mean, n.hold) -
+    2 * tail(p4.ar1.NHR$summary.fitted.values$sd, n.hold)
+)
+fore.up <- c(
+  rep(NA, n.train),
+  tail(p4.ar1.NHR$summary.fitted.values$mean, n.hold) +
+    2 * tail(p4.ar1.NHR$summary.fitted.values$sd, n.hold)
+)
+
+plot.df <-
+  cbind.data.frame(time = 1:n, obs, fore, fore.low, fore.up)
+
+plot.ar1 = plot.df %>%
+  ggplot(aes(x = time)) +
+  geom_line(aes(y = obs), color = "#D55E00") +
+  geom_line(aes(y = fore), color = "#0072B2") +
+  geom_ribbon(aes(ymin = fore.low, ymax = fore.up), alpha =
+                .2) +
+  geom_vline(xintercept = n.train + 1,
+             ylab = "",
+             size = 0.2) +
+  xlab(label = "t") +
+  ylab(label = "Night Heart Rate") +
+  ggtitle("AR(1) with level and trend model for pt4")
+
+fore =c(rep(NA, n.train),
+  tail(patient4.ar2$summary.fitted.values$mean, n.hold))
+obs = data4$NightHeartRate
+fore.low <- c(
+  rep(NA, n.train),
+  tail(patient4.ar2$summary.fitted.values$mean, n.hold) -
+    2 * tail(patient4.ar2$summary.fitted.values$sd, n.hold)
+)
+fore.up <- c(
+  rep(NA, n.train),
+  tail(patient4.ar2$summary.fitted.values$mean, n.hold) +
+    2 * tail(patient4.ar2$summary.fitted.values$sd, n.hold)
+)
+
+plot.df <-
+  cbind.data.frame(time = 1:n, obs, fore, fore.low, fore.up)
+plot.ar2 = plot.df %>%
+  ggplot(aes(x = time)) +
+  geom_line(aes(y = obs), color = "#D55E00") +
+  geom_line(aes(y = fore), color = "#0072B2") +
+  geom_ribbon(aes(ymin = fore.low, ymax = fore.up), alpha =
+                .2) +
+  geom_vline(xintercept = n.train + 1,
+             ylab = "",
+             size = 0.2) +
+  xlab(label = "t") +
+  ylab(label = "Night Heart Rate") +
+  ggtitle("AR(2) with level and trend model for pt4")
+
+
+grid.arrange(plot.ar1,plot.ar2)
+```
+
+MAE and MAPE
+```{r}
+mae.ar1 = mae(yhold = tail(data4$NightHeartRate,n.hold), 
+              yfore = tail(p4.ar1.NHR$summary.fitted.values$mean, n.hold))
+mape.ar1 = mape(yhold = tail(data4$NightHeartRate,n.hold), 
+              yfore = tail(p4.ar1.NHR$summary.fitted.values$mean, n.hold))
+print(paste("For AR(1) using data for pt.4 we have: ", mae.ar1, "and", mape.ar1))
+```
+
+```{r}
+mae.ar2 = mae(yhold = tail(data4$NightHeartRate,n.hold), 
+              yfore = tail(patient4.ar2$summary.fitted.values$mean, n.hold))
+mape.ar2 = mape(yhold = tail(data4$NightHeartRate,n.hold), 
+              yfore = tail(patient4.ar2$summary.fitted.values$mean, n.hold))
+print(paste("For AR(2) using data for pt.4 we have: ", mae.ar2, "and", mape.ar2))
+```
+
+For patient 5:
+```{r, echo=FALSE}
+n = nrow(data5)
+n.hold = 5
+n.train = n - n.hold
+
+fore =c(rep(NA, n.train),
+  tail(p5.ar1.NHR$summary.fitted.values$mean, n.hold))
+obs = data5$NightHeartRate
+fore.low <- c(
+  rep(NA, n.train),
+  tail(p5.ar1.NHR$summary.fitted.values$mean, n.hold) -
+    2 * tail(p5.ar1.NHR$summary.fitted.values$sd, n.hold)
+)
+fore.up <- c(
+  rep(NA, n.train),
+  tail(p5.ar1.NHR$summary.fitted.values$mean, n.hold) +
+    2 * tail(p5.ar1.NHR$summary.fitted.values$sd, n.hold)
+)
+
+plot.df <-
+  cbind.data.frame(time = 1:n, obs, fore, fore.low, fore.up)
+
+plot.ar1 = plot.df %>%
+  ggplot(aes(x = time)) +
+  geom_line(aes(y = obs), color = "#D55E00") +
+  geom_line(aes(y = fore), color = "#0072B2") +
+  geom_ribbon(aes(ymin = fore.low, ymax = fore.up), alpha =
+                .2) +
+  geom_vline(xintercept = n.train + 1,
+             ylab = "",
+             size = 0.2) +
+  xlab(label = "t") +
+  ylab(label = "Night Heart Rate") +
+  ggtitle("AR(1) with level and trend model for pt5")
+
+fore =c(rep(NA, n.train),
+  tail(patient5.ar2$summary.fitted.values$mean, n.hold))
+obs = data5$NightHeartRate
+fore.low <- c(
+  rep(NA, n.train),
+  tail(patient5.ar2$summary.fitted.values$mean, n.hold) -
+    2 * tail(patient5.ar2$summary.fitted.values$sd, n.hold)
+)
+fore.up <- c(
+  rep(NA, n.train),
+  tail(patient5.ar2$summary.fitted.values$mean, n.hold) +
+    2 * tail(patient5.ar2$summary.fitted.values$sd, n.hold)
+)
+
+plot.df <-
+  cbind.data.frame(time = 1:n, obs, fore, fore.low, fore.up)
+plot.ar2 = plot.df %>%
+  ggplot(aes(x = time)) +
+  geom_line(aes(y = obs), color = "#D55E00") +
+  geom_line(aes(y = fore), color = "#0072B2") +
+  geom_ribbon(aes(ymin = fore.low, ymax = fore.up), alpha =
+                .2) +
+  geom_vline(xintercept = n.train + 1,
+             ylab = "",
+             size = 0.2) +
+  xlab(label = "t") +
+  ylab(label = "Night Heart Rate") +
+  ggtitle("AR(2) with level and trend model for pt5")
+
+grid.arrange(plot.ar1,plot.ar2)
+```
+
+MAE and MAPE
+```{r}
+mae.ar1 = mae(yhold = tail(data5$NightHeartRate,n.hold), 
+              yfore = tail(p5.ar1.NHR$summary.fitted.values$mean, n.hold))
+mape.ar1 = mape(yhold = tail(data5$NightHeartRate,n.hold), 
+              yfore = tail(p5.ar1.NHR$summary.fitted.values$mean, n.hold))
+print(paste("For AR(1) using data for pt.5 we have: ", mae.ar1, "and", mape.ar1))
+```
+
+```{r}
+mae.ar2 = mae(yhold = tail(data5$NightHeartRate,n.hold), 
+              yfore = tail(patient5.ar2$summary.fitted.values$mean, n.hold))
+mape.ar2 = mape(yhold = tail(data5$NightHeartRate,n.hold), 
+              yfore = tail(patient5.ar2$summary.fitted.values$mean, n.hold))
+print(paste("For AR(2) using data for pt.5 we have: ", mae.ar2, "and", mape.ar2))
+```
+
+
+
+
+
+
+
+
+
+
+
+
